@@ -1,3 +1,4 @@
 *.log
 Alter.exe
 *.zip
+__pycache__/
