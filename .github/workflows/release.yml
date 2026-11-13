@@ -1,0 +1,72 @@
+# Builds Alter on a real Windows machine and publishes a GitHub release.
+# Runs when a version tag is pushed (e.g. git tag v1.0.1 && git push origin v1.0.1),
+# or by hand from the Actions tab (then it only builds and tests, no release).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Alter.ps1 parses in Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\Alter.ps1), [ref]$null, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }; throw 'Alter.ps1 has syntax errors' }
+          Write-Host "PowerShell $($PSVersionTable.PSVersion): Alter.ps1 parses cleanly"
+
+      - name: Build Alter.exe
+        shell: powershell
+        run: |
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          & $csc /nologo /target:winexe /optimize+ /win32icon:logo\alter.ico /out:Alter.exe src\AlterLauncher.cs
+          if ($LASTEXITCODE -ne 0) { throw 'csc failed' }
+          Get-Item .\Alter.exe | Format-List Name, Length
+
+      - name: Smoke test - make a copy of Notepad from the command line
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Alter.ps1 -Name 'CI Test' -Target "$env:WINDIR\System32\notepad.exe" -NoDesktopShortcut
+          if ($LASTEXITCODE -ne 0) { throw "Alter exited with $LASTEXITCODE" }
+          $dir = Join-Path $env:LOCALAPPDATA 'ParallWin\CI Test'
+          foreach ($f in 'config.txt', 'icon.ico', 'CI Test.exe') {
+            if (-not (Test-Path -LiteralPath (Join-Path $dir $f))) { throw "missing $f" }
+          }
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Alter\CI Test.lnk'
+          if (-not (Test-Path -LiteralPath $lnk)) { throw 'Start Menu shortcut missing' }
+          Get-Content (Join-Path $dir 'config.txt')
+          Write-Host 'Smoke test passed'
+
+      - name: Package Alter.zip
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force dist\Alter | Out-Null
+          Copy-Item Alter.exe, Alter.ps1, 'Start Alter.cmd', Test-Alter.ps1, README.md, LICENSE -Destination dist\Alter
+          Copy-Item fonts, logo, src -Destination dist\Alter -Recurse
+          Compress-Archive -Path dist\Alter -DestinationPath Alter.zip -Force
+          Get-Item .\Alter.zip | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Alter
+          path: Alter.zip
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag Alter.zip --title ("Alter " + $tag.TrimStart('v')) --notes-file .github/RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
