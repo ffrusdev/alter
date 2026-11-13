@@ -1,11 +1,12 @@
-# Builds Alter on a real Windows machine and publishes a GitHub release.
-# Runs when a version tag is pushed (e.g. git tag v1.0.1 && git push origin v1.0.1),
-# or by hand from the Actions tab (then it only builds and tests, no release).
+# Builds Alter on a real Windows machine, tests it, and publishes a GitHub release.
+# Runs on every push to main. It only releases when the version in the VERSION file
+# has no release yet, so to publish a new version: change VERSION (e.g. 1.0.1),
+# update .github/RELEASE_NOTES.md, and push. Can also be run by hand from the Actions tab.
 name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -61,12 +62,16 @@ jobs:
           name: Alter
           path: Alter.zip
 
-      - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish the release (only if this version has none yet)
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          gh release create $tag Alter.zip --title ("Alter " + $tag.TrimStart('v')) --notes-file .github/RELEASE_NOTES.md
+          $version = (Get-Content VERSION -Raw).Trim()
+          $tag = "v$version"
+          # via cmd: in Windows PowerShell 5.1, redirecting a program's stderr can itself raise an error
+          cmd /c "gh release view $tag >nul 2>&1"
+          if ($LASTEXITCODE -eq 0) { Write-Host "Release $tag already exists; nothing to publish."; exit 0 }
+          gh release create $tag Alter.zip --target $env:GITHUB_SHA --title "Alter $version" --notes-file .github/RELEASE_NOTES.md
           if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
+          Write-Host "Published $tag"

@@ -171,6 +171,7 @@ Everything runs from source; only the small launcher is compiled.
 | `Test-Alter.ps1` | End-to-end check of a PC |
 | `fonts/` | Rubik, Inter and JetBrains Mono (SIL Open Font License) |
 | `logo/` | The logo as SVG, PNG and ICO |
+| `VERSION` | The current version. Changing it and pushing to `main` publishes a new release (see `.github/workflows/release.yml`) |
 
 Build `Alter.exe` with the C# compiler that ships with Windows:
 
