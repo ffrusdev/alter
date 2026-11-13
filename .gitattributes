@@ -1,0 +1,9 @@
+# Windows batch files need CRLF line endings to run reliably.
+*.cmd text eol=crlf
+*.ps1 text
+*.cs  text
+*.md  text
+*.exe binary
+*.ico binary
+*.png binary
+*.ttf binary

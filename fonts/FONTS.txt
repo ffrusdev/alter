@@ -1,0 +1,9 @@
+Fonts used by the Alter window (loaded from this folder; nothing is installed on your PC).
+
+Rubik (Bold, ExtraBold)      headings, buttons, letter tiles
+Inter (Regular, Medium, SemiBold)   text
+JetBrains Mono (Regular)     paths and arguments
+
+All three are open-source fonts from Google Fonts (https://fonts.google.com),
+licensed under the SIL Open Font License 1.1 (https://openfontlicense.org).
+If this folder is missing, Alter uses Segoe UI and Consolas instead.
