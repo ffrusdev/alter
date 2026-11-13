@@ -1,19 +1,20 @@
-# Builds Alter on a real Windows machine, tests it, and publishes a GitHub release.
-# Runs on every push to main. It only releases when the version in the VERSION file
-# has no release yet, so to publish a new version: change VERSION (e.g. 1.0.1),
-# update .github/RELEASE_NOTES.md, and push. Can also be run by hand from the Actions tab.
+# Builds and tests Alter on real Windows and Linux machines, then publishes a GitHub release.
+# Runs on every push to main. It only releases when the version in the VERSION file has no
+# release yet, so to publish a new version: change VERSION (e.g. 1.1.1), update
+# .github/RELEASE_NOTES.md, and push. Can also be run by hand from the Actions tab.
 name: Release
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write   # needed to create the release
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,19 +60,49 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Alter
+          name: windows
           path: Alter.zip
 
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test (including two real Chrome copies on a virtual display)
+        run: |
+          sudo apt-get install -y -qq desktop-file-utils >/dev/null
+          ALTER_TEST_BROWSER="$(command -v google-chrome)" xvfb-run -a python3 linux/test_alter.py
+
+      - name: Package alter-linux.tar.gz
+        run: |
+          mkdir -p dist/alter-linux/logo
+          cp linux/alter linux/install.sh linux/README.md LICENSE dist/alter-linux/
+          cp logo/alter-logo.svg dist/alter-linux/logo/
+          tar -C dist -czf alter-linux.tar.gz alter-linux
+          tar -tzf alter-linux.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: alter-linux.tar.gz
+
+  release:
+    needs: [windows, linux]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
       - name: Publish the release (only if this version has none yet)
-        shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = (Get-Content VERSION -Raw).Trim()
-          $tag = "v$version"
-          # via cmd: in Windows PowerShell 5.1, redirecting a program's stderr can itself raise an error
-          cmd /c "gh release view $tag >nul 2>&1"
-          if ($LASTEXITCODE -eq 0) { Write-Host "Release $tag already exists; nothing to publish."; exit 0 }
-          gh release create $tag Alter.zip --target $env:GITHUB_SHA --title "Alter $version" --notes-file .github/RELEASE_NOTES.md
-          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
-          Write-Host "Published $tag"
+          version="$(tr -d '[:space:]' < VERSION)"
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to publish."
+            exit 0
+          fi
+          gh release create "$tag" windows/Alter.zip linux/alter-linux.tar.gz \
+            --target "$GITHUB_SHA" --title "Alter $version" --notes-file .github/RELEASE_NOTES.md
+          echo "Published $tag"

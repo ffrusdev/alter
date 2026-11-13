@@ -9,11 +9,11 @@
 A work Chrome next to a personal one. A second Claude desktop on another account. Two Discord accounts at once. Alter makes a copy of the app that behaves like its own app: its own data folder, its own shortcut, its own button on the taskbar.
 
 - Free and open source
-- Windows 10 and 11
+- Windows 10 and 11, and now [Linux](#linux) too
 - Nothing to install: it runs on the PowerShell and .NET compiler that come with Windows
 - Inspired by Parall on macOS
 
-**[⬇ Download the latest release](../../releases/latest)** · [Website](https://ffrusdev.github.io/alter/)
+**[⬇ Download the latest release](https://github.com/ffrusdev/alter/releases/latest)** · [Website](https://ffrusdev.github.io/alter/)
 
 ---
 
@@ -26,6 +26,7 @@ A work Chrome next to a personal one. A second Claude desktop on another account
   - [4. Edit, stop or delete a copy](#4-edit-stop-or-delete-a-copy)
   - [Microsoft Store apps (like Claude)](#microsoft-store-apps-like-claude)
   - [Command line](#command-line)
+- [Linux](#linux)
 - [Troubleshooting](#troubleshooting)
 - [How it works](#how-it-works)
 - [Limits](#limits)
@@ -38,7 +39,7 @@ A work Chrome next to a personal one. A second Claude desktop on another account
 
 ### 1. Download and open Alter
 
-1. Download **Alter.zip** from the [latest release](../../releases/latest).
+1. Download **Alter.zip** from the [latest release](https://github.com/ffrusdev/alter/releases/latest).
 2. Right-click the zip, choose **Extract All**, and put the **Alter** folder somewhere permanent, for example in Documents.
 3. Open the folder and double-click **Alter.exe**.
 4. The first time, Windows may show **"Windows protected your PC"**, because Alter isn't signed with a paid certificate. Click **More info**, then **Run anyway**.
@@ -107,6 +108,24 @@ Options: `-Icon <path to .png/.ico>`, `-Mode Auto|Chromium|Firefox|Redirect|None
 
 ---
 
+## Linux
+
+Alter for Linux is a small command-line tool (one Python 3 script, no dependencies) that makes the same kind of copies: own data, own name and icon, own app-menu entry. Chromium-based apps also get their own dock button.
+
+```bash
+# from the latest release: alter-linux.tar.gz
+tar xzf alter-linux.tar.gz && cd alter-linux && ./install.sh
+
+alter apps chrome                              # find the app
+alter new "Chrome Work" --app google-chrome    # make a copy (it appears in your app menu)
+alter launch "Chrome Work"                     # or click it in the app menu
+alter list                                     # see your copies and which are running
+```
+
+It handles Chrome, Chromium, Edge, Brave, Firefox, Electron apps (VS Code, Slack, Discord, Obsidian…), Flatpak apps and most other apps. Full guide: **[linux/README.md](linux/README.md)**.
+
+---
+
 ## Troubleshooting
 
 | Problem | What to do |
@@ -116,7 +135,7 @@ Options: `-Icon <path to .png/.ico>`, `-Mode Auto|Chromium|Firefox|Redirect|None
 | The copy opens your normal app instead of a new window | The app has a hard single-instance lock. Try **Isolation: Redirect**, then **Save changes**. Some apps can't be made to run twice (see [Limits](#limits)). |
 | Signing in to the copy logs in your normal app instead | Some apps sign in through your browser and hand the login back through a link that Windows sends to the normal app. Close the normal app while you sign in to the copy. |
 | "Alter.ps1 is missing" | Keep `Alter.exe` in the same folder as `Alter.ps1` and the `fonts` folder. |
-| Alter shows an error box | It includes the line where the error happened. Please [open an issue](../../issues) with a screenshot of it. |
+| Alter shows an error box | It includes the line where the error happened. Please [open an issue](https://github.com/ffrusdev/alter/issues) with a screenshot of it. |
 
 To check your PC end to end (PowerShell, compiler, and a test copy of Chrome or Edge), run `Test-Alter.ps1`. It writes `Test-Alter.log`:
 
@@ -171,6 +190,7 @@ Everything runs from source; only the small launcher is compiled.
 | `Test-Alter.ps1` | End-to-end check of a PC |
 | `fonts/` | Rubik, Inter and JetBrains Mono (SIL Open Font License) |
 | `logo/` | The logo as SVG, PNG and ICO |
+| `linux/` | Alter for Linux: the `alter` command, its installer and tests |
 | `VERSION` | The current version. Changing it and pushing to `main` publishes a new release (see `.github/workflows/release.yml`) |
 
 Build `Alter.exe` with the C# compiler that ships with Windows:

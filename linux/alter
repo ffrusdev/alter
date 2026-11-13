@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""Alter for Linux: run separate copies of any app, each with its own data, name, icon and launcher.
+
+Each copy lives in ~/.local/share/alter/copies/<id>/ :
+    config.json   what the copy runs and how
+    launch        the script that starts it (the app-menu entry runs this)
+    data/         the copy's own profile and settings
+    icon.svg      a letter tile, if the copy uses one
+and gets an app-menu entry: ~/.local/share/applications/alter-<id>.desktop
+
+Run `alter --help` or `alter <command> --help`. Python 3.8+, standard library only.
+"""
+
+import argparse
+import configparser
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "1.1.0"
+
+HOME = os.path.expanduser("~")
+DATA_HOME = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+ROOT = os.path.join(DATA_HOME, "alter", "copies")
+APPS_DIR = os.path.join(DATA_HOME, "applications")
+
+# ---------------------------------------------------------------------------------------------
+# App knowledge (same idea as the Windows version)
+# ---------------------------------------------------------------------------------------------
+CHROMIUM_NAMES = {
+    "google-chrome", "google-chrome-stable", "google-chrome-beta", "google-chrome-unstable", "chrome",
+    "chromium", "chromium-browser", "brave", "brave-browser", "brave-browser-stable",
+    "microsoft-edge", "microsoft-edge-stable", "msedge", "vivaldi", "vivaldi-stable", "opera", "thorium-browser",
+    "code", "code-insiders", "codium", "vscodium", "cursor", "windsurf",
+    "slack", "discord", "discord-ptb", "discord-canary", "obsidian", "signal-desktop", "element-desktop",
+    "notion-app", "notion", "figma-linux", "postman", "mattermost-desktop", "github-desktop",
+}
+EDITOR_NAMES = {"code", "code-insiders", "codium", "vscodium", "cursor", "windsurf"}
+FIREFOX_NAMES = {"firefox", "firefox-esr", "firefox-bin", "thunderbird", "librewolf", "waterfox", "floorp", "zen", "zen-browser"}
+
+# Flatpak IDs that are Chromium/Electron apps (they take --user-data-dir).
+CHROMIUM_FLATPAKS = {
+    "com.google.Chrome", "org.chromium.Chromium", "com.brave.Browser", "com.microsoft.Edge", "com.vivaldi.Vivaldi",
+    "com.visualstudio.code", "com.vscodium.codium", "com.slack.Slack", "com.discordapp.Discord",
+    "md.obsidian.Obsidian", "org.signal.Signal", "im.riot.Riot", "com.github.IsmaelMartinez.teams_for_linux",
+}
+FIREFOX_FLATPAKS = {"org.mozilla.firefox", "org.mozilla.Thunderbird", "io.gitlab.librewolf-community"}
+
+MODES = ("chromium", "firefox", "redirect", "home", "none")
+MODE_HELP = {
+    "chromium": "own --user-data-dir (Chrome, Edge, Brave, VS Code, Slack, Discord and other Electron apps)",
+    "firefox": "own --profile, started with --no-remote",
+    "redirect": "XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME and XDG_STATE_HOME point at the copy's folder",
+    "home": "HOME points at the copy's folder (for apps that keep settings directly in ~/.something)",
+    "none": "no data separation, only a separate launcher, name and icon",
+}
+
+CORAL, TILE, BORDER = "#FF8F7A", "#141414", "#262626"
+
+
+def die(msg, code=1):
+    print(f"alter: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def say(msg):
+    print(msg)
+
+
+# ---------------------------------------------------------------------------------------------
+# Names
+# ---------------------------------------------------------------------------------------------
+def check_name(name):
+    name = (name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9 _\-]{1,40}", name):
+        die("a name must be 1-40 characters: letters, numbers, spaces, - or _.")
+    return name
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "copy"
+
+
+def monogram(name):
+    """'Claude 2' -> CL2, 'Slack Client' -> SC, 'Discord' -> DIS (same rule as the Windows app)."""
+    words = [w for w in re.sub(r"[^A-Za-z0-9 ]", " ", name).split() if w]
+    if not words:
+        return "ALT"
+    if len(words) == 1:
+        m = words[0][:3]
+    elif len(words) == 2 and words[1].isdigit():
+        m = words[0][:2] + words[1][:1]
+    else:
+        m = "".join(w[0] for w in words[:3])
+    return m.upper()
+
+
+def tile_svg(name):
+    text = monogram(name)
+    size = {1: 120, 2: 104, 3: 84}.get(len(text), 84)
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">\n'
+        f'  <rect x="12" y="12" width="232" height="232" rx="56" fill="{TILE}" stroke="{BORDER}" stroke-width="4"/>\n'
+        f'  <text x="128" y="128" dy="0.35em" text-anchor="middle" font-family="Rubik, Inter, DejaVu Sans, sans-serif"\n'
+        f'        font-weight="800" font-size="{size}" fill="{CORAL}">{text}</text>\n'
+        "</svg>\n"
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# Finding apps: commands, .desktop files, Flatpaks
+# ---------------------------------------------------------------------------------------------
+def desktop_dirs():
+    dirs = [APPS_DIR]
+    for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":"):
+        if d:
+            dirs.append(os.path.join(d, "applications"))
+    dirs += ["/var/lib/flatpak/exports/share/applications",
+             os.path.join(DATA_HOME, "flatpak", "exports", "share", "applications"),
+             "/var/lib/snapd/desktop/applications"]
+    seen, out = set(), []
+    for d in dirs:
+        if d not in seen and os.path.isdir(d):
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def read_desktop(path):
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.optionxform = str
+    try:
+        cp.read(path, encoding="utf-8")
+        return dict(cp["Desktop Entry"]) if cp.has_section("Desktop Entry") else None
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        return None
+
+
+def exec_argv(exec_line):
+    """Exec= line -> argv, without field codes like %U."""
+    try:
+        parts = shlex.split(exec_line)
+    except ValueError:
+        parts = exec_line.split()
+    return [p for p in parts if not re.fullmatch(r"%[a-zA-Z%]", p)]
+
+
+def all_desktop_apps():
+    apps, seen = [], set()
+    for d in desktop_dirs():
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".desktop") or fn.startswith("alter-") or fn in seen:
+                continue
+            e = read_desktop(os.path.join(d, fn))
+            if not e or e.get("Type", "Application") != "Application" or e.get("NoDisplay") == "true" or not e.get("Exec"):
+                continue
+            seen.add(fn)
+            apps.append({"id": fn, "path": os.path.join(d, fn), "name": e.get("Name", fn), "exec": e["Exec"],
+                         "icon": e.get("Icon", ""), "wmclass": e.get("StartupWMClass", "")})
+    return apps
+
+
+def find_desktop_for(cmd_path):
+    """The installed .desktop entry that starts this command, for its name and icon."""
+    want = {os.path.basename(cmd_path), os.path.basename(os.path.realpath(cmd_path))}
+    for a in all_desktop_apps():
+        argv = exec_argv(a["exec"])
+        if argv and (os.path.basename(argv[0]) in want or argv[0] == cmd_path):
+            return a
+    return None
+
+
+def flatpak_id_from_argv(argv):
+    if argv and os.path.basename(argv[0]) == "flatpak" and "run" in argv:
+        rest = [a for a in argv[argv.index("run") + 1:] if not a.startswith("-")]
+        return rest[0] if rest else None
+    return None
+
+
+def resolve_app(app):
+    """--app value -> dict(kind, target, base, name, icon). Accepts a command, a path,
+    a .desktop file or id, or flatpak:<app id>."""
+    if app.startswith("flatpak:"):
+        fid = app.split(":", 1)[1]
+        if not shutil.which("flatpak"):
+            die("flatpak isn't installed.")
+        if subprocess.run(["flatpak", "info", fid], capture_output=True).returncode != 0:
+            die(f"no Flatpak app called {fid}. See `flatpak list --app`.")
+        entry = None
+        for a in all_desktop_apps():
+            if flatpak_id_from_argv(exec_argv(a["exec"])) == fid or a["id"] == fid + ".desktop":
+                entry = a
+                break
+        return {"kind": "flatpak", "target": fid, "base": fid, "name": entry["name"] if entry else fid.split(".")[-1],
+                "icon": entry["icon"] if entry else fid}
+
+    if app.endswith(".desktop"):
+        path = app if os.path.isfile(app) else next((a["path"] for a in all_desktop_apps() if a["id"] == app), None)
+        if not path:
+            die(f"no app-menu entry called {app}. See `alter apps`.")
+        e = read_desktop(path) or {}
+        argv = exec_argv(e.get("Exec", ""))
+        fid = flatpak_id_from_argv(argv)
+        if fid:
+            return resolve_app("flatpak:" + fid)
+        if not argv:
+            die(f"{app} has no Exec line.")
+        info = resolve_app(argv[0])
+        info["name"], info["icon"] = e.get("Name", info["name"]), e.get("Icon", info["icon"])
+        info["extra_args"] = argv[1:]
+        return info
+
+    if "/snap/" in app or app.startswith("snap:"):
+        die("Snap apps aren't supported: their sandbox ignores a separate data folder. Install the app another way "
+            "(.deb, .rpm, tarball or Flatpak) and use that.")
+    path = app if os.sep in app else shutil.which(app)
+    if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        die(f"can't find an app called {app}. Give a command name, a full path, a .desktop file or flatpak:<id>.")
+    path = os.path.abspath(path)
+    if os.path.realpath(path).startswith("/snap/"):
+        die("Snap apps aren't supported: their sandbox ignores a separate data folder.")
+    entry = find_desktop_for(path)
+    return {"kind": "exe", "target": path, "base": os.path.basename(os.path.realpath(path)),
+            "name": entry["name"] if entry else os.path.basename(path), "icon": entry["icon"] if entry else ""}
+
+
+def is_electron(path):
+    d = os.path.dirname(os.path.realpath(path))
+    return any(os.path.exists(os.path.join(d, f)) for f in ("resources/app.asar", "v8_context_snapshot.bin", "chrome_crashpad_handler"))
+
+
+def auto_mode(info):
+    if info["kind"] == "flatpak":
+        if info["target"] in CHROMIUM_FLATPAKS:
+            return "chromium"
+        if info["target"] in FIREFOX_FLATPAKS:
+            return "firefox"
+        return "redirect"
+    names = {info["base"].lower(), os.path.basename(info["target"]).lower()}
+    if names & FIREFOX_NAMES:
+        return "firefox"
+    if names & CHROMIUM_NAMES or is_electron(info["target"]):
+        return "chromium"
+    return "redirect"
+
+
+# ---------------------------------------------------------------------------------------------
+# Copies on disk
+# ---------------------------------------------------------------------------------------------
+def copy_dir(cid):
+    return os.path.join(ROOT, cid)
+
+
+def desktop_path(cid):
+    return os.path.join(APPS_DIR, f"alter-{cid}.desktop")
+
+
+def load(cid_or_name):
+    cid = slug(cid_or_name)
+    p = os.path.join(copy_dir(cid), "config.json")
+    if not os.path.isfile(p):
+        die(f"no copy called {cid_or_name}. See `alter list`.")
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def all_copies():
+    if not os.path.isdir(ROOT):
+        return []
+    out = []
+    for cid in sorted(os.listdir(ROOT)):
+        p = os.path.join(copy_dir(cid), "config.json")
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                out.append(json.load(f))
+    return out
+
+
+def data_dir(cfg):
+    """Where the copy keeps its data. Flatpak copies keep it inside the app's own sandbox folder,
+    the only place the app is allowed to write."""
+    if cfg["kind"] == "flatpak":
+        return os.path.join(HOME, ".var", "app", cfg["target"], "alter", cfg["id"])
+    return os.path.join(copy_dir(cfg["id"]), "data")
+
+
+def mode_args_env(cfg):
+    data, mode = data_dir(cfg), cfg["mode"]
+    args, env = [], {}
+    if mode == "chromium":
+        args.append(f"--user-data-dir={data}/profile")
+        if cfg["base"].lower() in EDITOR_NAMES or cfg["target"] in ("com.visualstudio.code", "com.vscodium.codium"):
+            args.append(f"--extensions-dir={data}/extensions")
+        # Own window class, so the dock / taskbar can tell the copy from the original (X11 and XWayland).
+        args.append(f"--class=alter-{cfg['id']}")
+        if cfg["base"].lower().startswith("discord") or cfg["target"].startswith("com.discordapp"):
+            args.insert(0, "--multi-instance")
+    elif mode == "firefox":
+        args += ["--profile", f"{data}/profile", "--no-remote"]
+    elif mode == "redirect":
+        env = {"XDG_CONFIG_HOME": f"{data}/config", "XDG_DATA_HOME": f"{data}/share",
+               "XDG_CACHE_HOME": f"{data}/cache", "XDG_STATE_HOME": f"{data}/state"}
+    elif mode == "home":
+        env = {"HOME": f"{data}/home"}
+    return args, env
+
+
+def write_launcher(cfg):
+    """The launch script: creates the data folders, sets the copy's environment, starts the app.
+    ALTER_COPY marks every process of the copy, so `alter stop` and `alter list` can find them."""
+    margs, menv = mode_args_env(cfg)
+    env = dict(menv)
+    env.update(cfg.get("env", {}))
+    data = data_dir(cfg)
+    folders = [data] + [v for v in env.values() if v.startswith(data)]
+    if cfg["mode"] in ("chromium", "firefox"):
+        folders.append(f"{data}/profile")
+    lines = ["#!/bin/sh", f"# Alter copy: {cfg['name']} (made by Alter {VERSION}; recreated by `alter edit`).",
+             f"export ALTER_COPY={shlex.quote(cfg['id'])}",
+             "mkdir -p " + " ".join(shlex.quote(f) for f in folders)]
+    if cfg["kind"] == "flatpak":
+        cmd = ["flatpak", "run", f"--env=ALTER_COPY={cfg['id']}"] + [f"--env={k}={v}" for k, v in env.items()]
+        cmd += [cfg["target"]] + margs + cfg.get("args", [])
+    else:
+        for k, v in env.items():
+            lines.append(f"export {k}={shlex.quote(v)}")
+        cmd = [cfg["target"]] + cfg.get("extra_args", []) + margs + cfg.get("args", [])
+    lines.append("exec " + " ".join(shlex.quote(c) for c in cmd) + ' "$@"')
+    path = os.path.join(copy_dir(cfg["id"]), "launch")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+def write_icon(cfg, icon_arg):
+    """Icon for the app menu: the user's file, a letter tile, or the original app's icon."""
+    d = copy_dir(cfg["id"])
+    for old in ("icon.svg", "icon.png", "icon.xpm"):
+        if os.path.exists(os.path.join(d, old)):
+            os.remove(os.path.join(d, old))
+    if icon_arg and icon_arg != "tile":
+        if not os.path.isfile(icon_arg):
+            die(f"icon file not found: {icon_arg}")
+        ext = os.path.splitext(icon_arg)[1].lower()
+        if ext not in (".svg", ".png", ".xpm"):
+            die("the icon must be a .svg, .png or .xpm file.")
+        dst = os.path.join(d, "icon" + ext)
+        shutil.copyfile(icon_arg, dst)
+        return dst, "custom"
+    if icon_arg == "tile" or not cfg.get("app_icon"):
+        dst = os.path.join(d, "icon.svg")
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(tile_svg(cfg["name"]))
+        return dst, "tile"
+    return cfg["app_icon"], "app"
+
+
+def write_desktop(cfg, launcher):
+    lines = [
+        "[Desktop Entry]",
+        "Type=Application",
+        "Version=1.0",
+        f"Name={cfg['name']}",
+        f"Comment=Alter copy of {cfg['app_name']}, with its own data",
+        f"Exec=\"{launcher}\" %U",
+        f"Icon={cfg['icon']}",
+        "Terminal=false",
+        "Categories=Utility;",
+        f"X-Alter-Copy={cfg['id']}",
+    ]
+    if cfg["mode"] == "chromium":
+        lines.append(f"StartupWMClass=alter-{cfg['id']}")
+    os.makedirs(APPS_DIR, exist_ok=True)
+    p = desktop_path(cfg["id"])
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(p, 0o755)
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", APPS_DIR], capture_output=True)
+    return p
+
+
+def save(cfg, icon_arg=None, menu=True):
+    os.makedirs(copy_dir(cfg["id"]), exist_ok=True)
+    cfg["icon"], cfg["icon_kind"] = write_icon(cfg, icon_arg) if icon_arg is not None or "icon" not in cfg else (cfg["icon"], cfg["icon_kind"])
+    launcher = write_launcher(cfg)
+    cfg["menu"] = menu
+    with open(os.path.join(copy_dir(cfg["id"]), "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    if menu:
+        write_desktop(cfg, launcher)
+    elif os.path.exists(desktop_path(cfg["id"])):
+        os.remove(desktop_path(cfg["id"]))
+    return launcher
+
+
+# ---------------------------------------------------------------------------------------------
+# Running processes
+# ---------------------------------------------------------------------------------------------
+def copy_pids(cid):
+    """Processes of this copy: those carrying ALTER_COPY=<id> (set by its launcher and inherited by
+    every child), plus anything started with the copy's data folder in its command line."""
+    me = os.getpid()
+    marker = f"ALTER_COPY={cid}".encode()
+    folder = (copy_dir(cid) + "/").encode()
+    pids = []
+    for p in os.listdir("/proc"):
+        if not p.isdigit() or int(p) == me:
+            continue
+        try:
+            with open(f"/proc/{p}/environ", "rb") as f:
+                if marker in f.read().split(b"\0"):
+                    pids.append(int(p))
+                    continue
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                if folder in f.read():
+                    pids.append(int(p))
+        except OSError:
+            continue
+    return pids
+
+
+def is_running(cid):
+    return bool(copy_pids(cid))
+
+
+# ---------------------------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------------------------
+def cmd_new(a):
+    name = check_name(a.name)
+    cid = slug(name)
+    if os.path.exists(os.path.join(copy_dir(cid), "config.json")) and not a.replace:
+        die(f"a copy called {name} already exists. Use `alter edit` to change it, or add --replace.")
+    info = resolve_app(a.app)
+    mode = info_mode = auto_mode(info)
+    if a.mode and a.mode != "auto":
+        mode = a.mode
+    env = {}
+    for kv in a.env or []:
+        if "=" not in kv:
+            die(f"--env needs KEY=VALUE, got {kv}")
+        k, v = kv.split("=", 1)
+        env[k] = v
+    cfg = {"id": cid, "name": name, "kind": info["kind"], "target": info["target"], "base": info["base"],
+           "app_name": info["name"], "app_icon": info["icon"], "mode": mode, "args": a.arg or [],
+           "extra_args": info.get("extra_args", []), "env": env, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "alter_version": VERSION}
+    launcher = save(cfg, icon_arg=a.icon or "", menu=not a.no_menu)
+    say(f"Created {name}.")
+    say(f"  app:      {info['name']} ({info['target']})")
+    say(f"  mode:     {mode}{'' if mode == info_mode else f' (auto would pick {info_mode})'}: {MODE_HELP[mode]}")
+    say(f"  data:     {data_dir(cfg)}")
+    say(f"  launcher: {launcher}")
+    if not a.no_menu:
+        say(f"  app menu: {desktop_path(cid)}")
+    say(f"Start it with: alter launch {shlex.quote(name)}")
+    if a.launch:
+        cmd_launch(argparse.Namespace(name=name, args=[]))
+
+
+def cmd_list(a):
+    copies = all_copies()
+    if a.json:
+        print(json.dumps([dict(c, running=is_running(c["id"])) for c in copies], indent=2))
+        return
+    if not copies:
+        say("No copies yet. Make one with: alter new \"Chrome Work\" --app google-chrome")
+        return
+    w = max(len(c["name"]) for c in copies)
+    for c in copies:
+        state = "running" if is_running(c["id"]) else "stopped"
+        say(f"{monogram(c['name']):<4} {c['name']:<{w}}  {state:<8} {c['mode']:<9} {c['app_name']}")
+
+
+def cmd_info(a):
+    c = load(a.name)
+    margs, menv = mode_args_env(c)
+    say(f"{c['name']}  [{monogram(c['name'])}]  {'running' if is_running(c['id']) else 'stopped'}")
+    say(f"  app:        {c['app_name']} ({c['kind']}: {c['target']})")
+    say(f"  mode:       {c['mode']}: {MODE_HELP[c['mode']]}")
+    say(f"  data:       {data_dir(c)}")
+    say(f"  arguments:  {' '.join(c.get('extra_args', []) + margs + c.get('args', [])) or 'none'}")
+    env = dict(menv)
+    env.update(c.get("env", {}))
+    say("  environment:" + ("" if env else " none"))
+    for k, v in env.items():
+        say(f"    {k}={v}")
+    say(f"  icon:       {c['icon']} ({c['icon_kind']})")
+    say(f"  launcher:   {os.path.join(copy_dir(c['id']), 'launch')}")
+    say(f"  app menu:   {desktop_path(c['id']) if c.get('menu', True) else 'no entry'}")
+
+
+def cmd_launch(a):
+    c = load(a.name)
+    launcher = os.path.join(copy_dir(c["id"]), "launch")
+    if not os.path.exists(launcher):
+        die(f"the launcher for {c['name']} is missing. Run `alter edit {shlex.quote(c['name'])}` to rebuild it.")
+    log = open(os.path.join(copy_dir(c["id"]), "last-run.log"), "wb")
+    subprocess.Popen([launcher] + (a.args or []), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     start_new_session=True, cwd=HOME)
+    say(f"Launched {c['name']}.")
+
+
+def cmd_stop(a):
+    c = load(a.name)
+    pids = copy_pids(c["id"])
+    if not pids:
+        say(f"{c['name']} isn't running.")
+        return
+    sig = signal.SIGKILL if a.force else signal.SIGTERM
+    for p in pids:
+        try:
+            os.kill(p, sig)
+        except OSError:
+            pass
+    deadline = time.time() + (2 if a.force else a.wait)
+    while time.time() < deadline and copy_pids(c["id"]):
+        time.sleep(0.2)
+    left = copy_pids(c["id"])
+    if left:
+        say(f"{c['name']} is still running ({len(left)} process{'es' if len(left) != 1 else ''}). "
+            f"Close it from its window, or run: alter stop {shlex.quote(c['name'])} --force")
+        sys.exit(1)
+    say(f"Stopped {c['name']}.")
+
+
+def cmd_edit(a):
+    c = load(a.name)
+    if a.mode:
+        c["mode"] = auto_mode({"kind": c["kind"], "target": c["target"], "base": c["base"]}) if a.mode == "auto" else a.mode
+    if a.arg is not None:
+        c["args"] = a.arg
+    if a.clear_args:
+        c["args"] = []
+    for kv in a.env or []:
+        if "=" not in kv:
+            die(f"--env needs KEY=VALUE, got {kv}")
+        k, v = kv.split("=", 1)
+        c["env"][k] = v
+    for k in a.unset_env or []:
+        c["env"].pop(k, None)
+    menu = c.get("menu", True)
+    if a.menu:
+        menu = True
+    if a.no_menu:
+        menu = False
+    save(c, icon_arg=a.icon, menu=menu)
+    say(f"Saved {c['name']}. Changes apply the next time it starts.")
+
+
+def cmd_delete(a):
+    c = load(a.name)
+    if is_running(c["id"]):
+        die(f"{c['name']} is running. Stop it first: alter stop {shlex.quote(c['name'])}")
+    if not a.yes:
+        if not sys.stdin.isatty():
+            die("add --yes to delete without asking.")
+        ans = input(f"Delete {c['name']}? This removes its launcher, app-menu entry AND its data "
+                    f"(sign-ins, settings). The original app is not touched. [y/N] ")
+        if ans.strip().lower() not in ("y", "yes"):
+            say("Not deleted.")
+            return
+    if os.path.exists(desktop_path(c["id"])):
+        os.remove(desktop_path(c["id"]))
+    if c["kind"] == "flatpak" and os.path.isdir(data_dir(c)):
+        shutil.rmtree(data_dir(c))
+    shutil.rmtree(copy_dir(c["id"]))
+    if shutil.which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", APPS_DIR], capture_output=True)
+    say(f"Deleted {c['name']}.")
+
+
+def cmd_apps(a):
+    apps = all_desktop_apps()
+    q = (a.search or "").lower()
+    shown = 0
+    for x in apps:
+        if q and q not in x["name"].lower() and q not in x["id"].lower():
+            continue
+        argv = exec_argv(x["exec"])
+        fid = flatpak_id_from_argv(argv)
+        use = f"flatpak:{fid}" if fid else x["id"]
+        say(f"{x['name'][:34]:<35} --app {use}")
+        shown += 1
+    if not shown:
+        say("No matching apps." if q else "No apps found in the app menu.")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="alter", description="Run separate copies of any app, each with its own data, name, icon and launcher.")
+    p.add_argument("--version", action="version", version=f"Alter for Linux {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="command")
+
+    s = sub.add_parser("new", help="make a copy of an app")
+    s.add_argument("name", help='name of the copy, e.g. "Chrome Work"')
+    s.add_argument("--app", required=True, help="command (google-chrome), path, .desktop file/id, or flatpak:<app id>")
+    s.add_argument("--mode", choices=("auto",) + MODES, default="auto", help="how to keep its data apart (default: auto)")
+    s.add_argument("--icon", help='a .svg/.png/.xpm file, or "tile" for a letter tile (default: the app\'s own icon)')
+    s.add_argument("--arg", action="append", help="extra argument for the app (repeatable)")
+    s.add_argument("--env", action="append", metavar="KEY=VALUE", help="extra environment variable (repeatable)")
+    s.add_argument("--no-menu", action="store_true", help="don't add an app-menu entry")
+    s.add_argument("--launch", action="store_true", help="start it right away")
+    s.add_argument("--replace", action="store_true", help="overwrite an existing copy's settings (its data is kept)")
+    s.set_defaults(func=cmd_new)
+
+    s = sub.add_parser("list", help="list copies and whether they're running")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("info", help="show a copy's details")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_info)
+
+    s = sub.add_parser("launch", help="start a copy (extra arguments, e.g. a URL, are passed to the app)")
+    s.add_argument("name")
+    s.add_argument("args", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_launch)
+
+    s = sub.add_parser("stop", help="close a copy")
+    s.add_argument("name")
+    s.add_argument("--force", action="store_true", help="kill it instead of asking it to close")
+    s.add_argument("--wait", type=float, default=8, help="seconds to wait for it to close (default 8)")
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("edit", help="change a copy's mode, arguments, environment, icon or menu entry")
+    s.add_argument("name")
+    s.add_argument("--mode", choices=("auto",) + MODES)
+    s.add_argument("--icon", help='a .svg/.png/.xpm file, "tile", or "" for the app\'s own icon')
+    s.add_argument("--arg", action="append", help="replace the extra arguments (repeatable)")
+    s.add_argument("--clear-args", action="store_true")
+    s.add_argument("--env", action="append", metavar="KEY=VALUE")
+    s.add_argument("--unset-env", action="append", metavar="KEY")
+    s.add_argument("--menu", action="store_true", help="add the app-menu entry")
+    s.add_argument("--no-menu", action="store_true", help="remove the app-menu entry")
+    s.set_defaults(func=cmd_edit)
+
+    s = sub.add_parser("delete", help="delete a copy and its data (the original app is not touched)")
+    s.add_argument("name")
+    s.add_argument("--yes", "-y", action="store_true", help="don't ask")
+    s.set_defaults(func=cmd_delete)
+
+    s = sub.add_parser("apps", help="list installed apps and the --app value to copy each one")
+    s.add_argument("search", nargs="?")
+    s.set_defaults(func=cmd_apps)
+
+    a = p.parse_args(argv)
+    if not a.cmd:
+        p.print_help()
+        return
+    if sys.platform != "linux":
+        die("this is Alter for Linux. On Windows, use Alter.exe.")
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()
