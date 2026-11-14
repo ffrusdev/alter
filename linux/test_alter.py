@@ -145,12 +145,18 @@ class AlterTest(unittest.TestCase):
         for name in ("Chrome Work", "Chrome Home"):
             self.run_alter("new", name, "--app", browser, "--mode", "chromium", "--arg=--no-first-run", *extra)
             self.run_alter("launch", name)
-        time.sleep(8)
-        out = self.run_alter("list").stdout
+        # Wait (up to 30 s, CI machines can be slow) until both copies run and have made their own profile.
+        profiles = [os.path.join(self.share, "alter", "copies", cid, "data", "profile", "Default")
+                    for cid in ("chrome-work", "chrome-home")]
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            out = self.run_alter("list").stdout
+            if out.count("running") == 2 and all(os.path.isdir(p) for p in profiles):
+                break
+            time.sleep(0.5)
         self.assertEqual(out.count("running"), 2, out)
-        for cid in ("chrome-work", "chrome-home"):
-            prof = os.path.join(self.share, "alter", "copies", cid, "data", "profile")
-            self.assertTrue(os.path.isdir(os.path.join(prof, "Default")), f"{cid} has no profile")
+        for p in profiles:
+            self.assertTrue(os.path.isdir(p), f"no profile at {p}")
         self.run_alter("stop", "Chrome Home")
         out = self.run_alter("list").stdout
         self.assertIn("Chrome Work  running", out)
