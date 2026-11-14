@@ -11,7 +11,6 @@ A work Chrome next to a personal one. A second Claude desktop on another account
 - Free and open source
 - Windows 10 and 11, and now [Linux](#linux) too
 - Nothing to install: it runs on the PowerShell and .NET compiler that come with Windows
-- Inspired by Parall on macOS
 
 **[⬇ Download the latest release](https://github.com/ffrusdev/alter/releases/latest)** · [Website](https://ffrusdev.github.io/alter/)
 
@@ -148,7 +147,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-Alter.ps1 -Cleanu
 
 ## How it works
 
-For each copy, Alter creates a folder in `%LOCALAPPDATA%\ParallWin\<Name>\` (the folder keeps Alter's original name, Parall-Win):
+For each copy, Alter creates a folder in `%LOCALAPPDATA%\ParallWin\<Name>\`:
 
 | File | What it is |
 |---|---|
@@ -204,6 +203,5 @@ Build `Alter.exe` with the C# compiler that ships with Windows:
 ## Credits and license
 
 - Made by [Nabil Luqman (frus)](https://ffrusdev.github.io/).
-- Inspired by Parall for macOS. Alter is an independent project, not affiliated with Parall.
 - Fonts: [Rubik](https://fonts.google.com/specimen/Rubik), [Inter](https://fonts.google.com/specimen/Inter) and [JetBrains Mono](https://fonts.google.com/specimen/JetBrains+Mono), under the SIL Open Font License 1.1.
 - Alter is released under the [MIT License](LICENSE).
