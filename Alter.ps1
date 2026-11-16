@@ -1023,6 +1023,7 @@ namespace AlterUi
         public string Target { get; set; }
         public string Real { get; set; }
         public string Level { get; set; }
+        public int Rank { get; set; }      // 0 works, 1 might work, 2 won't work (for sorting)
         public string Badge { get; set; }
         public string Reason { get; set; }
         public object Icon { get; set; }
@@ -1287,6 +1288,39 @@ namespace AlterUi
         </Setter.Value>
       </Setter>
     </Style>
+    <!-- Filter chips on the app picker. Tag="Selected" marks the active one. -->
+    <Style x:Key="Chip" TargetType="Button">
+      <Setter Property="Height" Value="32"/>
+      <Setter Property="Margin" Value="0,0,8,6"/>
+      <Setter Property="Foreground" Value="#C9C4BF"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="FontWeight" Value="Medium"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Bd" CornerRadius="16" Padding="14,0" Background="#161616" BorderBrush="#262626" BorderThickness="1">
+              <ContentPresenter VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#3A3A3A"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#FFB3A5"/>
+              </Trigger>
+              <Trigger Property="Tag" Value="Selected">
+                <Setter TargetName="Bd" Property="Background" Value="#2A1C19"/>
+                <Setter TargetName="Bd" Property="BorderBrush" Value="#FF8F7A"/>
+                <Setter Property="Foreground" Value="#F4F1EE"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <!-- Sidebar navigation. Tag="Selected" marks the current page. -->
     <Style x:Key="BtnNav" TargetType="Button">
       <Setter Property="Height" Value="44"/>
@@ -2088,7 +2122,19 @@ namespace AlterUi
               </DockPanel>
             </Border>
           </DockPanel>
-          <TextBlock x:Name="txtPickInfo" Style="{StaticResource Muted}" FontSize="13" Margin="2,12,0,0"/>
+          <DockPanel Margin="0,14,0,0">
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Top" Margin="12,0,0,0">
+              <TextBlock Text="Sort by" Foreground="#A39E99" FontSize="13" VerticalAlignment="Center" Margin="0,0,10,0"/>
+              <ComboBox x:Name="cmbPickSort" Width="170" Height="36"/>
+            </StackPanel>
+            <WrapPanel x:Name="pnlChips" VerticalAlignment="Center">
+              <Button x:Name="chipAll" Uid="all" Style="{StaticResource Chip}" Tag="Selected" Content="All"/>
+              <Button x:Name="chipWorks" Uid="works" Style="{StaticResource Chip}" Content="Works"/>
+              <Button x:Name="chipMaybe" Uid="maybe" Style="{StaticResource Chip}" Content="Might work"/>
+              <Button x:Name="chipNo" Uid="no" Style="{StaticResource Chip}" Content="Won't work"/>
+            </WrapPanel>
+          </DockPanel>
+          <TextBlock x:Name="txtPickInfo" Style="{StaticResource Muted}" FontSize="13" Margin="2,8,0,0"/>
         </StackPanel>
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
           <ItemsControl x:Name="icApps" Margin="40,0,40,32" Focusable="False">
@@ -2159,6 +2205,7 @@ foreach ($n in 'dotRunning', 'txtRunning', 'btnNewSide', 'navCopies', 'navNew', 
                'viewForm', 'btnFormBack', 'txtFormBack', 'txtFormTitle', 'txtFormSub', 'txtName', 'txtTarget', 'hintTarget',
                'verdictBox', 'dotVerdict', 'txtVerdict',
                'viewPicker', 'btnPickerBack', 'btnOtherExe', 'txtPickSearch', 'txtPickHint', 'txtPickInfo', 'icApps',
+               'cmbPickSort', 'pnlChips', 'chipAll', 'chipWorks', 'chipMaybe', 'chipNo',
                'btnTarget', 'txtIcon', 'hintIcon', 'btnIcon', 'btnDefaults', 'cmbMode', 'txtHint', 'txtArgs', 'txtEnv', 'hintEnv',
                'chkTaskbar', 'chkDesktop', 'chkStart', 'chkOpen', 'rowOpen',
                'txtPrevMono', 'imgPrev', 'txtPrevName', 'txtPrevMode', 'btnSave', 'btnCancel', 'txtFormStatus',
@@ -2675,12 +2722,45 @@ function Use-AppPath([string]$path, [string]$displayName) {
     $txtFormStatus.Text = "Detected isolation: $($cmbMode.SelectedItem)."
 }
 
+# Chip labels with counts, and how many apps the list shows right now.
 function Update-PickerInfo {
     $all = @($script:apps)
     $works = @($all | Where-Object { $_.Level -eq 'works' }).Count
     $maybe = @($all | Where-Object { $_.Level -eq 'maybe' }).Count
     $no = @($all | Where-Object { $_.Level -eq 'no' }).Count
-    $txtPickInfo.Text = [string]$all.Count + ' apps: ' + $works + ' work, ' + $maybe + ' might work, ' + $no + " won't work. Not listed? Use Other .exe."
+    $chipAll.Content = 'All (' + $all.Count + ')'
+    $chipWorks.Content = 'Works (' + $works + ')'
+    $chipMaybe.Content = 'Might work (' + $maybe + ')'
+    $chipNo.Content = "Won't work (" + $no + ')'
+    $shown = 0
+    if ($script:apps) { $shown = @([System.Windows.Data.CollectionViewSource]::GetDefaultView($script:apps)).Count }
+    $txtPickInfo.Text = 'Showing ' + $shown + ' of ' + $all.Count + ' apps. Not listed? Use Other .exe.'
+}
+
+# Sort by: Works first (verdict, then name), Name (A-Z), Name (Z-A).
+function Set-PickSort {
+    if (-not $script:apps) { return }
+    $pv = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:apps)
+    $up = [System.ComponentModel.ListSortDirection]::Ascending
+    $down = [System.ComponentModel.ListSortDirection]::Descending
+    $pv.SortDescriptions.Clear()
+    $i = $cmbPickSort.SelectedIndex
+    if ($i -eq 1) { $pv.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('Name', $up)) }
+    elseif ($i -eq 2) { $pv.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('Name', $down)) }
+    else {
+        $pv.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('Rank', $up))
+        $pv.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('Name', $up))
+    }
+}
+
+# Filter chips: all, works, maybe or no.
+function Set-PickLevel([string]$level) {
+    $script:pickLevel = $level
+    foreach ($c in $chipAll, $chipWorks, $chipMaybe, $chipNo) {
+        if ($c.Uid -eq $level) { $c.Tag = 'Selected' } else { $c.Tag = $null }
+    }
+    if ($script:apps) { [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:apps).Refresh() }
+    Update-PickerInfo
 }
 
 # Browse: a list of the installed apps with their verdicts (built once, then kept).
@@ -2698,6 +2778,9 @@ function Show-Picker {
                 $entry.Target = [string]$a.Target
                 $entry.Real = [string]$a.Real
                 $entry.Level = [string]$a.Level
+                $entry.Rank = 1
+                if ($entry.Level -eq 'works') { $entry.Rank = 0 }
+                if ($entry.Level -eq 'no') { $entry.Rank = 2 }
                 $entry.Badge = Get-BadgeLabel ([string]$a.Level)
                 $entry.Reason = [string]$a.Reason
                 if ($a.Real) {
@@ -2712,8 +2795,10 @@ function Show-Picker {
             $pv.Filter = [Predicate[object]] {
                 param($o)
                 $q = $txtPickSearch.Text.Trim()
-                return (-not $q -or $o.Name.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+                $levelOk = ($script:pickLevel -eq 'all' -or $o.Level -eq $script:pickLevel)
+                return ($levelOk -and (-not $q -or $o.Name.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0))
             }
+            Set-PickSort
         }
         finally { $win.Cursor = $null }
     }
@@ -2729,6 +2814,20 @@ $txtPickSearch.Add_TextChanged({
     try {
         if ($txtPickSearch.Text) { $txtPickHint.Visibility = 'Collapsed' } else { $txtPickHint.Visibility = 'Visible' }
         if ($script:apps) { [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:apps).Refresh() }
+        Update-PickerInfo
+    }
+    catch { }
+})
+
+$script:pickLevel = 'all'
+foreach ($s in 'Works first', 'Name (A-Z)', 'Name (Z-A)') { [void]$cmbPickSort.Items.Add($s) }
+$cmbPickSort.SelectedIndex = 0
+$cmbPickSort.Add_SelectionChanged({ try { Set-PickSort; Update-PickerInfo } catch { } })
+$pnlChips.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, [System.Windows.RoutedEventHandler] {
+    param($sender, $e)
+    try {
+        $b = $e.OriginalSource
+        if ($b -is [System.Windows.Controls.Button]) { Set-PickLevel $b.Uid }
     }
     catch { }
 })

@@ -24,6 +24,8 @@ This puts the `alter` command in `~/.local/bin` (no root needed). If your termin
 alter apps          # every app in your app menu, whether it can be copied, and the --app value to use
 alter apps chrome   # just the ones matching "chrome"
 alter apps --why    # also show the reason for each verdict
+alter apps --only works       # just the apps that work (or: maybe, no)
+alter apps --sort name        # A-Z instead of Works first (or: name-desc)
 ```
 
 Each app gets a verdict:

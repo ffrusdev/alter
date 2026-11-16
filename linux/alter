@@ -660,12 +660,19 @@ def cmd_apps(a):
             level, why = verdict(info)
         else:
             level, why = "maybe", "Couldn't find its program; Alter will check when you make the copy."
+        if a.only and level != a.only:
+            continue
         rows.append((x["name"], level, why, use))
-    # Works first, then Might work, then Won't work; alphabetical within each group.
+    # Default: Works first, then Might work, then Won't work; alphabetical within each group.
     rank = {"works": 0, "maybe": 1, "no": 2}
-    rows.sort(key=lambda r: (rank[r[1]], r[0].lower()))
+    if a.sort == "name":
+        rows.sort(key=lambda r: r[0].lower())
+    elif a.sort == "name-desc":
+        rows.sort(key=lambda r: r[0].lower(), reverse=True)
+    else:
+        rows.sort(key=lambda r: (rank[r[1]], r[0].lower()))
     if not rows:
-        say("No matching apps." if q else "No apps found in the app menu.")
+        say("No matching apps." if (q or a.only) else "No apps found in the app menu.")
         return
     if a.json:
         print(json.dumps([{"name": n, "verdict": lv, "reason": w, "app": u} for n, lv, w, u in rows], indent=2))
@@ -674,7 +681,7 @@ def cmd_apps(a):
         say(f"{BADGES[lv]:<11} {n[:34]:<35} --app {u}")
         if a.why:
             say(f"{'':<11} {w}")
-    counts = {lv: sum(1 for r in rows if r[1] == lv) for lv in BADGES}
+    counts = {lv: sum(1 for r in rows if r[1] == lv) for lv in BADGES}  # of the apps shown
     say(f"\n{len(rows)} apps: {counts['works']} work, {counts['maybe']} might work, {counts['no']} won't work."
         + ("" if a.why else " Add --why to see the reasons."))
 
@@ -735,6 +742,9 @@ def main(argv=None):
     s = sub.add_parser("apps", help="list installed apps, whether each can be copied, and the --app value to use")
     s.add_argument("search", nargs="?")
     s.add_argument("--why", action="store_true", help="show the reason for each verdict")
+    s.add_argument("--only", choices=("works", "maybe", "no"), help="show only apps that work, might work, or won't work")
+    s.add_argument("--sort", choices=("verdict", "name", "name-desc"), default="verdict",
+                   help="verdict (Works first, the default), name (A-Z) or name-desc (Z-A)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_apps)
 

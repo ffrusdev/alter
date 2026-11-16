@@ -55,7 +55,7 @@ After the first start, Alter is also in the **Start Menu**, and you can pin it t
    - **Might work**: apps Alter doesn't know. Each copy gets its own settings folders, which is enough for most apps.
    - **Won't work**: apps known to allow only one copy (Spotify, Steam and other game launchers, OneDrive, Office), and Store apps without a launch alias. You can still try them; Alter asks first.
 
-   Pick an app, or use **Other .exe…** for one that isn't in the list.
+   Search by name, show just one kind with the **Works** / **Might work** / **Won't work** chips, or change **Sort by** (Works first, or by name). Pick an app, or use **Other .exe…** for one that isn't in the list.
 3. Alter fills in a **Name** (like "Google Chrome 2"), picks the right **Isolation** mode, and shows the app's verdict under the App field. Change the name if you like, for example to "Chrome Work".
 4. Optional: pick an **Icon** (`.png` or `.ico`). Without one, the copy shows a letter tile like **CW** for "Chrome Work".
 5. Under **Options**, choose whether the copy gets its own taskbar button, a Desktop shortcut and a Start Menu shortcut.

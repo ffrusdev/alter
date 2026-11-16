@@ -99,6 +99,11 @@ class AlterTest(unittest.TestCase):
         self.assertRegex(out, r"Won't work\s+Spotify")
         self.assertRegex(out, r"Might work\s+Notes")
         self.assertLess(out.index("Might work"), out.index("Won't work"), "Works / Might work / Won't work order")
+        only = self.run_alter("apps", "--only", "no").stdout
+        self.assertIn("Spotify", only)
+        self.assertNotIn("Notes", only)
+        by_name = self.run_alter("apps", "--sort", "name-desc").stdout
+        self.assertLess(by_name.index("Spotify"), by_name.index("Notes"), "Z-A puts Spotify before Notes")
         r = self.run_alter("new", "Spotify 2", "--app", "spotify")      # warns, but still makes the copy
         self.assertIn("probably won't work", r.stderr)
         self.assertTrue(os.path.exists(os.path.join(self.share, "alter", "copies", "spotify-2", "launch")))
