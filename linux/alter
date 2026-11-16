@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 HOME = os.path.expanduser("~")
 DATA_HOME = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
