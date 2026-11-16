@@ -869,6 +869,7 @@ function Get-PackageAliases($pkg) {
 function Get-InstalledApps {
     $list = New-Object 'System.Collections.Generic.List[object]'
     $seen = @{}
+    $winDir = $env:SystemRoot.TrimEnd('\') + '\'
     $shell = New-Object -ComObject WScript.Shell
     $menus = @((Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'),
                (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))
@@ -893,6 +894,8 @@ function Get-InstalledApps {
                 if (-not $target) { continue }
             }
             if (-not (Test-Path -LiteralPath $target)) { continue }
+            # Windows' own tools (Character Map, Disk Cleanup, consoles...) live in the Windows folder: leave them out.
+            if ($target.StartsWith($winDir, [StringComparison]::OrdinalIgnoreCase)) { continue }
             $key = $target.ToLowerInvariant()
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
