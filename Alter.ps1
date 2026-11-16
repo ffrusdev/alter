@@ -943,7 +943,9 @@ function Get-InstalledApps {
         }
     }
     catch { }
-    return @($list | Sort-Object Name)
+    # Works first, then Might work, then Won't work; alphabetical within each group.
+    $rank = @{ works = 0; maybe = 1; no = 2 }
+    return @($list | Sort-Object @{ Expression = { $rank[$_.Level] } }, @{ Expression = { $_.Name } })
 }
 
 # =====================================================================================================

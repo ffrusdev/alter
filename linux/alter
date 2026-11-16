@@ -661,7 +661,9 @@ def cmd_apps(a):
         else:
             level, why = "maybe", "Couldn't find its program; Alter will check when you make the copy."
         rows.append((x["name"], level, why, use))
-    rows.sort(key=lambda r: r[0].lower())
+    # Works first, then Might work, then Won't work; alphabetical within each group.
+    rank = {"works": 0, "maybe": 1, "no": 2}
+    rows.sort(key=lambda r: (rank[r[1]], r[0].lower()))
     if not rows:
         say("No matching apps." if q else "No apps found in the app menu.")
         return

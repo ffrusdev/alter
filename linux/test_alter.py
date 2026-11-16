@@ -98,6 +98,7 @@ class AlterTest(unittest.TestCase):
         out = self.run_alter("apps").stdout
         self.assertRegex(out, r"Won't work\s+Spotify")
         self.assertRegex(out, r"Might work\s+Notes")
+        self.assertLess(out.index("Might work"), out.index("Won't work"), "Works / Might work / Won't work order")
         r = self.run_alter("new", "Spotify 2", "--app", "spotify")      # warns, but still makes the copy
         self.assertIn("probably won't work", r.stderr)
         self.assertTrue(os.path.exists(os.path.join(self.share, "alter", "copies", "spotify-2", "launch")))
