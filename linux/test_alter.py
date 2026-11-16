@@ -71,6 +71,43 @@ class AlterTest(unittest.TestCase):
         self.assertEqual(m.monogram("Discord"), "DIS")
         self.assertEqual(m.monogram(""), "ALT")
 
+    def test_verdicts(self):
+        m = load_module()
+        v = lambda kind, target, base=None: m.verdict({"kind": kind, "target": target, "base": base or os.path.basename(target)})[0]
+        self.assertEqual(v("exe", "/usr/bin/google-chrome"), "works")
+        self.assertEqual(v("exe", "/usr/bin/firefox"), "works")
+        self.assertEqual(v("exe", "/usr/bin/discord"), "works")
+        self.assertEqual(v("exe", "/usr/bin/spotify"), "no")
+        self.assertEqual(v("exe", "/usr/games/steam"), "no")
+        self.assertEqual(v("exe", self.app), "maybe")
+        self.assertEqual(v("snap", "/snap/bin/firefox"), "no")
+        self.assertEqual(v("flatpak", "com.discordapp.Discord"), "works")
+        self.assertEqual(v("flatpak", "com.spotify.Client"), "no")
+        self.assertEqual(v("flatpak", "org.example.Unknown"), "maybe")
+
+    def test_apps_lists_verdicts_and_new_warns(self):
+        apps = os.path.join(self.share, "applications")
+        os.makedirs(apps, exist_ok=True)
+        spotify = os.path.join(self.bin, "spotify")
+        shutil.copy(self.app, spotify)
+        with open(os.path.join(apps, "spotify.desktop"), "w") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=Spotify\nExec=spotify %U\n")
+        with open(os.path.join(apps, "notes.desktop"), "w") as f:
+            f.write(f"[Desktop Entry]\nType=Application\nName=Notes\nExec={self.app}\n")
+        self.env["XDG_DATA_DIRS"] = os.path.join(self.tmp, "none")
+        out = self.run_alter("apps").stdout
+        self.assertRegex(out, r"Won't work\s+Spotify")
+        self.assertRegex(out, r"Might work\s+Notes")
+        self.assertLess(out.index("Might work"), out.index("Won't work"), "Works / Might work / Won't work order")
+        only = self.run_alter("apps", "--only", "no").stdout
+        self.assertIn("Spotify", only)
+        self.assertNotIn("Notes", only)
+        by_name = self.run_alter("apps", "--sort", "name-desc").stdout
+        self.assertLess(by_name.index("Spotify"), by_name.index("Notes"), "Z-A puts Spotify before Notes")
+        r = self.run_alter("new", "Spotify 2", "--app", "spotify")      # warns, but still makes the copy
+        self.assertIn("probably won't work", r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.share, "alter", "copies", "spotify-2", "launch")))
+
     def test_bad_names_are_refused(self):
         r = self.run_alter("new", "bad/name", "--app", self.app, check=False)
         self.assertNotEqual(r.returncode, 0)

@@ -50,10 +50,13 @@ After the first start, Alter is also in the **Start Menu**, and you can pin it t
 ### 2. Make a copy of an app
 
 1. Click **New copy**.
-2. Next to **App (.exe)**, click **Browse** and pick the app you want a copy of, for example:
-   - Chrome: `C:\Program Files\Google\Chrome\Application\chrome.exe`
-   - VS Code: `C:\Users\<you>\AppData\Local\Programs\Microsoft VS Code\Code.exe`
-3. Alter fills in a **Name** (like "Google Chrome 2") and picks the right **Isolation** mode for the app. Change the name if you like, for example to "Chrome Work".
+2. Next to **App (.exe)**, click **Browse**. Alter lists the apps in your Start Menu, each with a badge:
+   - **Works**: browsers and Electron apps (Chrome, Edge, Brave, Firefox, VS Code, Slack, Discord, Claude…). Each copy gets its own profile.
+   - **Might work**: apps Alter doesn't know. Each copy gets its own settings folders, which is enough for most apps.
+   - **Won't work**: apps known to allow only one copy (Spotify, Steam and other game launchers, OneDrive, Office), and Store apps without a launch alias. You can still try them; Alter asks first.
+
+   Search by name, show just one kind with the **Works** / **Might work** / **Won't work** chips, or change **Sort by** (Works first, or by name). Pick an app, or use **Other .exe…** for one that isn't in the list.
+3. Alter fills in a **Name** (like "Google Chrome 2"), picks the right **Isolation** mode, and shows the app's verdict under the App field. Change the name if you like, for example to "Chrome Work".
 4. Optional: pick an **Icon** (`.png` or `.ico`). Without one, the copy shows a letter tile like **CW** for "Chrome Work".
 5. Under **Options**, choose whether the copy gets its own taskbar button, a Desktop shortcut and a Start Menu shortcut.
 6. Click **Create copy**.

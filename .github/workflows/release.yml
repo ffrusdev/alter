@@ -49,6 +49,19 @@ jobs:
           Get-Content (Join-Path $dir 'config.txt')
           Write-Host 'Smoke test passed'
 
+      - name: List installed apps with their verdicts (what Browse shows)
+        shell: powershell
+        run: |
+          $out = powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Alter.ps1 -ListApps | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { throw "Alter -ListApps exited with $LASTEXITCODE" }
+          if ($out -notmatch "Works\s+(Google Chrome|Microsoft Edge)") { throw 'expected Chrome or Edge to be listed as Works' }
+          # Works first, then Might work, then Won't work
+          $rank = @{ 'Works' = 0; 'Might work' = 1; "Won't work" = 2 }
+          $order = @(($out -split "`r?`n") | ForEach-Object { if ($_ -match "^(Works|Might work|Won't work) ") { $rank[$Matches[1]] } })
+          for ($i = 1; $i -lt $order.Count; $i++) { if ($order[$i] -lt $order[$i - 1]) { throw 'the list is not ordered Works, Might work, Won''t work' } }
+          Write-Host "Order OK ($($order.Count) apps)"
+
       - name: Package Alter.zip
         shell: powershell
         run: |
