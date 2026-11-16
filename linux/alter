@@ -52,6 +52,24 @@ CHROMIUM_FLATPAKS = {
 }
 FIREFOX_FLATPAKS = {"org.mozilla.firefox", "org.mozilla.Thunderbird", "io.gitlab.librewolf-community"}
 
+# Apps known to refuse a second copy. A best guess: Alter warns, it never blocks.
+LAUNCHER_REASON = "Game launchers only allow one copy at a time, and anti-cheat blocks second copies of games."
+NO_COPY_APPS = {
+    "spotify": "Spotify only allows one copy running at a time.",
+    "steam": LAUNCHER_REASON, "steam-runtime": LAUNCHER_REASON, "heroic": LAUNCHER_REASON, "lutris": LAUNCHER_REASON,
+    "dropbox": "Sync apps only allow one copy per account.",
+}
+NO_COPY_FLATPAKS = {
+    "com.spotify.Client": NO_COPY_APPS["spotify"], "com.valvesoftware.Steam": LAUNCHER_REASON,
+    "com.heroicgameslauncher.hgl": LAUNCHER_REASON, "net.lutris.Lutris": LAUNCHER_REASON,
+    "com.dropbox.Client": NO_COPY_APPS["dropbox"],
+}
+BROWSER_NAMES = {"google-chrome", "google-chrome-stable", "google-chrome-beta", "google-chrome-unstable", "chrome",
+                 "chromium", "chromium-browser", "brave", "brave-browser", "brave-browser-stable", "microsoft-edge",
+                 "microsoft-edge-stable", "msedge", "vivaldi", "vivaldi-stable", "opera", "thorium-browser"}
+SNAP_REASON = "Snap app: its sandbox ignores a separate data folder. Install the .deb, tarball or Flatpak version instead."
+BADGES = {"works": "Works", "maybe": "Might work", "no": "Won't work"}
+
 MODES = ("chromium", "firefox", "redirect", "home", "none")
 MODE_HELP = {
     "chromium": "own --user-data-dir (Chrome, Edge, Brave, VS Code, Slack, Discord and other Electron apps)",
@@ -233,6 +251,53 @@ def resolve_app(app):
 def is_electron(path):
     d = os.path.dirname(os.path.realpath(path))
     return any(os.path.exists(os.path.join(d, f)) for f in ("resources/app.asar", "v8_context_snapshot.bin", "chrome_crashpad_handler"))
+
+
+def verdict(info):
+    """('works' | 'maybe' | 'no', reason) for a resolved app: can it run as a separate copy?"""
+    if info["kind"] == "snap":
+        return "no", SNAP_REASON
+    if info["kind"] == "flatpak":
+        fid = info["target"]
+        if fid in NO_COPY_FLATPAKS:
+            return "no", NO_COPY_FLATPAKS[fid]
+        if fid in CHROMIUM_FLATPAKS:
+            return "works", "Chromium/Electron Flatpak: each copy gets its own profile inside the app's sandbox folder."
+        if fid in FIREFOX_FLATPAKS:
+            return "works", "Firefox Flatpak: each copy gets its own profile."
+        return "maybe", "Flatpak app Alter doesn't know: each copy gets its own settings folders. Most apps work; some refuse to open twice."
+    names = {info["base"].lower(), os.path.basename(info["target"]).lower()}
+    for n in names:
+        if n in NO_COPY_APPS:
+            return "no", NO_COPY_APPS[n]
+    if any(n.startswith("discord") for n in names):
+        return "works", "Discord: each copy gets its own profile and runs with --multi-instance."
+    mode = auto_mode(info)
+    if mode == "firefox":
+        return "works", "Firefox family: each copy gets its own profile."
+    if mode == "chromium":
+        if names & BROWSER_NAMES:
+            return "works", "Chromium browser: each copy gets its own profile and dock button."
+        return "works", "Electron app: each copy gets its own profile."
+    return "maybe", "Not an app Alter knows: each copy gets its own settings folders. Most apps work; some refuse to open twice."
+
+
+def quick_info(entry):
+    """Resolve an app-menu entry without failing (for `alter apps`)."""
+    argv = exec_argv(entry["exec"])
+    fid = flatpak_id_from_argv(argv)
+    if fid:
+        return {"kind": "flatpak", "target": fid, "base": fid}, f"flatpak:{fid}"
+    if not argv:
+        return None, entry["id"]
+    if "/snap/" in entry["path"] or "/snap/" in argv[0]:
+        return {"kind": "snap", "target": argv[0], "base": os.path.basename(argv[0])}, entry["id"]
+    path = argv[0] if os.sep in argv[0] else shutil.which(argv[0])
+    if not path:
+        return None, entry["id"]
+    if os.path.realpath(path).startswith("/snap/"):
+        return {"kind": "snap", "target": path, "base": os.path.basename(path)}, entry["id"]
+    return {"kind": "exe", "target": path, "base": os.path.basename(os.path.realpath(path))}, entry["id"]
 
 
 def auto_mode(info):
@@ -441,6 +506,9 @@ def cmd_new(a):
     if os.path.exists(os.path.join(copy_dir(cid), "config.json")) and not a.replace:
         die(f"a copy called {name} already exists. Use `alter edit` to change it, or add --replace.")
     info = resolve_app(a.app)
+    level, why = verdict(info)
+    if level == "no":
+        print(f"alter: warning: {info['name']} probably won't work as a copy. {why} Making the copy anyway.", file=sys.stderr)
     mode = info_mode = auto_mode(info)
     if a.mode and a.mode != "auto":
         mode = a.mode
@@ -457,6 +525,7 @@ def cmd_new(a):
     launcher = save(cfg, icon_arg=a.icon or "", menu=not a.no_menu)
     say(f"Created {name}.")
     say(f"  app:      {info['name']} ({info['target']})")
+    say(f"  verdict:  {BADGES[level]}: {why}")
     say(f"  mode:     {mode}{'' if mode == info_mode else f' (auto would pick {info_mode})'}: {MODE_HELP[mode]}")
     say(f"  data:     {data_dir(cfg)}")
     say(f"  launcher: {launcher}")
@@ -582,17 +651,30 @@ def cmd_delete(a):
 def cmd_apps(a):
     apps = all_desktop_apps()
     q = (a.search or "").lower()
-    shown = 0
+    rows = []
     for x in apps:
         if q and q not in x["name"].lower() and q not in x["id"].lower():
             continue
-        argv = exec_argv(x["exec"])
-        fid = flatpak_id_from_argv(argv)
-        use = f"flatpak:{fid}" if fid else x["id"]
-        say(f"{x['name'][:34]:<35} --app {use}")
-        shown += 1
-    if not shown:
+        info, use = quick_info(x)
+        if info:
+            level, why = verdict(info)
+        else:
+            level, why = "maybe", "Couldn't find its program; Alter will check when you make the copy."
+        rows.append((x["name"], level, why, use))
+    rows.sort(key=lambda r: r[0].lower())
+    if not rows:
         say("No matching apps." if q else "No apps found in the app menu.")
+        return
+    if a.json:
+        print(json.dumps([{"name": n, "verdict": lv, "reason": w, "app": u} for n, lv, w, u in rows], indent=2))
+        return
+    for n, lv, w, u in rows:
+        say(f"{BADGES[lv]:<11} {n[:34]:<35} --app {u}")
+        if a.why:
+            say(f"{'':<11} {w}")
+    counts = {lv: sum(1 for r in rows if r[1] == lv) for lv in BADGES}
+    say(f"\n{len(rows)} apps: {counts['works']} work, {counts['maybe']} might work, {counts['no']} won't work."
+        + ("" if a.why else " Add --why to see the reasons."))
 
 
 def main(argv=None):
@@ -648,8 +730,10 @@ def main(argv=None):
     s.add_argument("--yes", "-y", action="store_true", help="don't ask")
     s.set_defaults(func=cmd_delete)
 
-    s = sub.add_parser("apps", help="list installed apps and the --app value to copy each one")
+    s = sub.add_parser("apps", help="list installed apps, whether each can be copied, and the --app value to use")
     s.add_argument("search", nargs="?")
+    s.add_argument("--why", action="store_true", help="show the reason for each verdict")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_apps)
 
     a = p.parse_args(argv)

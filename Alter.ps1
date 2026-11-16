@@ -22,7 +22,8 @@ param(
     [string]$Icon,
     [ValidateSet('Auto', 'Chromium', 'Firefox', 'Redirect', 'None')][string]$Mode = 'Auto',
     [string]$Arguments,
-    [switch]$NoDesktopShortcut
+    [switch]$NoDesktopShortcut,
+    [switch]$ListApps          # print the apps in the Start Menu with their Works / Might work / Won't work verdict
 )
 $ErrorActionPreference = 'Stop'
 
@@ -794,8 +795,169 @@ $TrashDir = Join-Path $Root '.trash'
 if (Test-Path -LiteralPath $TrashDir) { Remove-Item -LiteralPath $TrashDir -Recurse -Force -ErrorAction SilentlyContinue }
 
 # =====================================================================================================
+#  Can this app be copied? (the badges in the app picker)
+# =====================================================================================================
+# Apps known to refuse a second copy, by program name. This is a best guess: Alter warns, it never blocks.
+$LauncherReason = 'Game launchers only allow one copy at a time, and anti-cheat blocks second copies of games.'
+$SyncReason = 'Sync apps only allow one copy per Windows account.'
+$OfficeReason = 'Office apps share one running copy per Windows account.'
+$NoCopyApps = @{
+    'spotify' = 'Spotify only allows one copy running at a time.'
+    'steam' = $LauncherReason; 'steamwebhelper' = $LauncherReason; 'epicgameslauncher' = $LauncherReason
+    'battle.net' = $LauncherReason; 'battle.net launcher' = $LauncherReason; 'riotclientservices' = $LauncherReason
+    'eadesktop' = $LauncherReason; 'origin' = $LauncherReason; 'upc' = $LauncherReason; 'ubisoftconnect' = $LauncherReason
+    'galaxyclient' = $LauncherReason
+    'onedrive' = $SyncReason; 'dropbox' = $SyncReason
+    'winword' = $OfficeReason; 'excel' = $OfficeReason; 'powerpnt' = $OfficeReason; 'outlook' = $OfficeReason
+    'onenote' = $OfficeReason; 'msaccess' = $OfficeReason; 'mspub' = $OfficeReason
+}
+$BrowserNames = @('chrome', 'msedge', 'brave', 'vivaldi', 'opera', 'chromium', 'thorium')
+
+# Level ('works', 'maybe' or 'no') and a one-line reason, for the program that actually runs.
+function Get-AppVerdict([string]$exe) {
+    $b = Get-BaseName $exe
+    if ($NoCopyApps.ContainsKey($b)) { return [pscustomobject]@{ Level = 'no'; Reason = $NoCopyApps[$b] } }
+    if ($b -like 'discord*') {
+        return [pscustomobject]@{ Level = 'works'; Reason = 'Discord: each copy gets its own settings folder and runs with --multi-instance.' }
+    }
+    $m = Get-AutoMode $exe
+    if ($m -eq 'Firefox') { return [pscustomobject]@{ Level = 'works'; Reason = 'Firefox family: each copy gets its own profile.' } }
+    if ($m -eq 'Chromium') {
+        if ($BrowserNames -contains $b) { return [pscustomobject]@{ Level = 'works'; Reason = 'Chromium browser: each copy gets its own profile.' } }
+        return [pscustomobject]@{ Level = 'works'; Reason = 'Electron app: each copy gets its own profile.' }
+    }
+    return [pscustomobject]@{ Level = 'maybe'; Reason = 'Not an app Alter knows: each copy gets its own settings folders. Most apps work; some refuse to open twice.' }
+}
+
+# Squirrel apps (Discord, Slack...) live in <root>\app-1.2.3\<exe>; pick the newest version folder.
+function Find-SquirrelExe([string]$root, [string]$exeName) {
+    $best = $null
+    $bestV = $null
+    foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -Filter 'app-*' -ErrorAction SilentlyContinue)) {
+        $v = $null
+        if (-not [version]::TryParse($d.Name.Substring(4), [ref]$v)) { continue }
+        $c = Join-Path $d.FullName $exeName
+        if (-not (Test-Path -LiteralPath $c)) { continue }
+        if ($null -eq $bestV -or $v -gt $bestV) { $bestV = $v; $best = $c }
+    }
+    return $best
+}
+
+# Launch aliases of a Store package, with the app (Id) and real program each one starts.
+function Get-PackageAliases($pkg) {
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.Load((Join-Path $pkg.InstallLocation 'AppxManifest.xml'))
+    foreach ($node in $xml.SelectNodes("//*[local-name()='ExecutionAlias']")) {
+        $alias = $node.GetAttribute('Alias')
+        if (-not $alias) { continue }
+        $exe = $null
+        $appId = $null
+        $p = $node.ParentNode
+        while ($p -is [System.Xml.XmlElement]) {
+            if (-not $exe -and $p.GetAttribute('Executable')) { $exe = $p.GetAttribute('Executable') }
+            if ($p.LocalName -eq 'Application') { $appId = $p.GetAttribute('Id'); break }
+            $p = $p.ParentNode
+        }
+        $full = $null
+        if ($exe) { $full = Join-Path $pkg.InstallLocation $exe }
+        [pscustomobject]@{ Alias = $alias; AppId = $appId; Path = (Join-Path $AliasDir $alias); Exe = $full }
+    }
+}
+
+# The apps in the Start Menu: desktop apps through their shortcuts, Store apps through their launch aliases.
+# Each one: Name, Target (what a copy would start), Real (the actual program, for its icon), Level, Reason.
+function Get-InstalledApps {
+    $list = New-Object 'System.Collections.Generic.List[object]'
+    $seen = @{}
+    $shell = New-Object -ComObject WScript.Shell
+    $menus = @((Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs'),
+               (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))
+    foreach ($menu in $menus) {
+        if (-not (Test-Path -LiteralPath $menu)) { continue }
+        foreach ($lnk in @(Get-ChildItem -LiteralPath $menu -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue)) {
+            if ($lnk.FullName -like '*\Programs\Alter\*' -or $lnk.Name -eq 'Alter.lnk') { continue }   # Alter and its own copies
+            $label = [IO.Path]::GetFileNameWithoutExtension($lnk.Name)
+            if ($label -match '(?i)uninstall|readme|read me|help|documentation|release notes|website|license|changelog|manual') { continue }
+            $target = $null
+            $lnkArgs = ''
+            try {
+                $sc = $shell.CreateShortcut($lnk.FullName)
+                $target = [string]$sc.TargetPath
+                $lnkArgs = [string]$sc.Arguments
+            }
+            catch { continue }
+            if (-not $target -or [IO.Path]::GetExtension($target) -ne '.exe') { continue }
+            # Squirrel apps start through Update.exe --processStart <app>.exe
+            if ([IO.Path]::GetFileName($target) -eq 'Update.exe' -and $lnkArgs -match '--processStart\s+"?([^"\s]+)') {
+                $target = Find-SquirrelExe (Split-Path -Parent $target) $Matches[1]
+                if (-not $target) { continue }
+            }
+            if (-not (Test-Path -LiteralPath $target)) { continue }
+            $key = $target.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            $v = Get-AppVerdict $target
+            $list.Add([pscustomobject]@{ Name = $label; Target = $target; Real = $target; Level = $v.Level; Reason = $v.Reason })
+        }
+    }
+    # Microsoft Store apps (not the ones built into Windows)
+    try {
+        $pkgs = @{}
+        foreach ($pk in @(Get-AppxPackage -ErrorAction SilentlyContinue)) {
+            if (-not $pk.IsFramework -and [string]$pk.SignatureKind -ne 'System' -and $pk.InstallLocation) { $pkgs[$pk.PackageFamilyName] = $pk }
+        }
+        $aliasCache = @{}
+        foreach ($sa in @(Get-StartApps -ErrorAction SilentlyContinue)) {
+            $id = [string]$sa.AppID
+            $bang = $id.IndexOf('!')
+            if ($bang -lt 0) { continue }
+            $pkg = $pkgs[$id.Substring(0, $bang)]
+            if (-not $pkg) { continue }
+            $appId = $id.Substring($bang + 1)
+            $fam = $pkg.PackageFamilyName
+            if (-not $aliasCache.ContainsKey($fam)) {
+                $found = @()
+                try { $found = @(Get-PackageAliases $pkg) } catch { }
+                $aliasCache[$fam] = $found
+            }
+            $hits = @($aliasCache[$fam] | Where-Object { $_.AppId -eq $appId -and (Test-Path -LiteralPath $_.Path) } |
+                Sort-Object { $_.Alias.Length })
+            if ($hits.Count -gt 0) {
+                $h = $hits[0]
+                $key = $h.Path.ToLowerInvariant()
+                if ($seen.ContainsKey($key)) { continue }
+                $seen[$key] = $true
+                $real = $h.Path
+                if ($h.Exe -and (Test-Path -LiteralPath $h.Exe)) { $real = $h.Exe }
+                $v = Get-AppVerdict $real
+                $list.Add([pscustomobject]@{ Name = [string]$sa.Name; Target = $h.Path; Real = $real; Level = $v.Level
+                        Reason = 'Microsoft Store app, started through its launch alias. ' + $v.Reason })
+            }
+            else {
+                $list.Add([pscustomobject]@{ Name = [string]$sa.Name; Target = ''; Real = ''; Level = 'no'
+                        Reason = "Microsoft Store app without a launch alias: Windows doesn't let other programs start it with its own settings." })
+            }
+        }
+    }
+    catch { }
+    return @($list | Sort-Object Name)
+}
+
+# =====================================================================================================
 #  CLI mode
 # =====================================================================================================
+if ($ListApps) {
+    $apps = @(Get-InstalledApps)
+    $labels = @{ works = 'Works'; maybe = 'Might work'; no = "Won't work" }
+    $apps | Format-Table @{ n = 'Verdict'; e = { $labels[$_.Level] } }, Name, Target, Reason -AutoSize -Wrap |
+        Out-String -Width 400 | Write-Host
+    $nWorks = @($apps | Where-Object { $_.Level -eq 'works' }).Count
+    $nMaybe = @($apps | Where-Object { $_.Level -eq 'maybe' }).Count
+    $nNo = @($apps | Where-Object { $_.Level -eq 'no' }).Count
+    Write-Host "$($apps.Count) apps: $nWorks work, $nMaybe might work, $nNo won't work."
+    exit 0
+}
+
 if ($Name -and $Target) {
     if ($Mode -eq 'Auto') { $Mode = Get-AutoMode $Target }
     $d = Get-ModeDefaults $Mode $Target
@@ -847,6 +1009,18 @@ namespace AlterUi
                 if (h != null) h(this, new PropertyChangedEventArgs("Running"));
             }
         }
+    }
+
+    // One row in the app picker.
+    public class AppEntry
+    {
+        public string Name { get; set; }
+        public string Target { get; set; }
+        public string Real { get; set; }
+        public string Level { get; set; }
+        public string Badge { get; set; }
+        public string Reason { get; set; }
+        public object Icon { get; set; }
     }
 
     public class EnvItem
@@ -1616,6 +1790,13 @@ namespace AlterUi
                                  Foreground="#5C5854" VerticalAlignment="Center" Margin="15,0,0,0" IsHitTestVisible="False"/>
                     </Grid>
                   </DockPanel>
+                  <!-- Can this app be copied? Shown after picking an app. -->
+                  <Border x:Name="verdictBox" CornerRadius="12" Padding="14,10" Margin="0,-8,0,18" Background="#1E1E1E" Visibility="Collapsed">
+                    <DockPanel>
+                      <Ellipse x:Name="dotVerdict" DockPanel.Dock="Left" Width="8" Height="8" Margin="0,5,10,0" VerticalAlignment="Top" Fill="#F2C46D"/>
+                      <TextBlock x:Name="txtVerdict" FontSize="13" Foreground="#C9C4BF" TextWrapping="Wrap"/>
+                    </DockPanel>
+                  </Border>
                   <TextBlock Style="{StaticResource FieldLabel}">
                     <Run Text="Icon"/><Run Text=" - optional, uses the app's own if empty" Foreground="#A39E99" FontWeight="Normal"/>
                   </TextBlock>
@@ -1869,6 +2050,97 @@ namespace AlterUi
         </StackPanel>
       </ScrollViewer>
 
+      <!-- ===== App picker (Browse) ===== -->
+      <Grid x:Name="viewPicker" Visibility="Collapsed">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+        <StackPanel Margin="40,36,40,16">
+          <Button x:Name="btnPickerBack" Style="{StaticResource BtnLink}">
+            <StackPanel Orientation="Horizontal">
+              <Path Data="M15,6 L9,12 L15,18" Stroke="#FF8F7A" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                    StrokeLineJoin="Round" Width="24" Height="24" VerticalAlignment="Center">
+                <Path.LayoutTransform><ScaleTransform ScaleX="0.6" ScaleY="0.6"/></Path.LayoutTransform>
+              </Path>
+              <TextBlock Text="Back to the form" VerticalAlignment="Center" Margin="4,0,0,0"/>
+            </StackPanel>
+          </Button>
+          <TextBlock Text="Pick an app" Style="{StaticResource H1}" Margin="0,6,0,0"/>
+          <TextBlock Text="Apps from your Start Menu. The badge shows how well each one can be copied." Style="{StaticResource Muted}" Margin="0,6,0,20"/>
+          <DockPanel>
+            <Button x:Name="btnOtherExe" DockPanel.Dock="Right" Style="{StaticResource BtnSoft}" Content="Other .exe..." Margin="8,0,0,0"/>
+            <Border Height="44" Padding="14,0" CornerRadius="12" Background="#161616" BorderBrush="#262626" BorderThickness="1">
+              <DockPanel>
+                <Path DockPanel.Dock="Left" Data="M11,4 A7,7 0 1 1 10.99,4 Z M20,20 L16.5,16.5" Stroke="#A39E99" StrokeThickness="2"
+                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" Width="24" Height="24" VerticalAlignment="Center" Margin="0,0,6,0">
+                  <Path.LayoutTransform><ScaleTransform ScaleX="0.67" ScaleY="0.67"/></Path.LayoutTransform>
+                </Path>
+                <Grid>
+                  <TextBox x:Name="txtPickSearch" Style="{StaticResource BareBox}"/>
+                  <TextBlock x:Name="txtPickHint" Text="Search apps" Foreground="#6F6A66" VerticalAlignment="Center" IsHitTestVisible="False"/>
+                </Grid>
+              </DockPanel>
+            </Border>
+          </DockPanel>
+          <TextBlock x:Name="txtPickInfo" Style="{StaticResource Muted}" FontSize="13" Margin="2,12,0,0"/>
+        </StackPanel>
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+          <ItemsControl x:Name="icApps" Margin="40,0,40,32" Focusable="False">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Button Uid="pick" Cursor="Hand" Margin="0,0,0,8" FocusVisualStyle="{x:Null}" ToolTip="{Binding Target}">
+                  <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                      <Border x:Name="Bd" Background="#161616" BorderBrush="#242424" BorderThickness="1" CornerRadius="14" Padding="14,12">
+                        <ContentPresenter/>
+                      </Border>
+                      <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                          <Setter TargetName="Bd" Property="BorderBrush" Value="#3A3A3A"/>
+                          <Setter TargetName="Bd" Property="Background" Value="#1A1A1A"/>
+                        </Trigger>
+                      </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                  </Button.Template>
+                  <DockPanel>
+                    <Border Width="40" Height="40" CornerRadius="11" Background="#0B0B0B" BorderBrush="#262626" BorderThickness="1"
+                            Margin="0,0,14,0" DockPanel.Dock="Left">
+                      <Image Source="{Binding Icon}" Width="26" Height="26" RenderOptions.BitmapScalingMode="HighQuality"/>
+                    </Border>
+                    <Border x:Name="BadgeBd" DockPanel.Dock="Right" Height="26" CornerRadius="13" Padding="10,0" Margin="12,0,0,0"
+                            VerticalAlignment="Center" Background="#2A2418">
+                      <StackPanel Orientation="Horizontal">
+                        <Ellipse x:Name="BadgeDot" Width="6" Height="6" Fill="#F2C46D" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <TextBlock x:Name="BadgeText" Text="{Binding Badge}" FontSize="12" FontWeight="SemiBold" Foreground="#F2C46D"
+                                   VerticalAlignment="Center"/>
+                      </StackPanel>
+                    </Border>
+                    <StackPanel VerticalAlignment="Center">
+                      <TextBlock Text="{Binding Name}" FontFamily="{DynamicResource FontDisplay}" FontWeight="Bold" FontSize="15"
+                                 Foreground="#F4F1EE" TextTrimming="CharacterEllipsis"/>
+                      <TextBlock Text="{Binding Reason}" FontSize="12" Foreground="#A39E99" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                    </StackPanel>
+                  </DockPanel>
+                </Button>
+                <DataTemplate.Triggers>
+                  <DataTrigger Binding="{Binding Level}" Value="works">
+                    <Setter TargetName="BadgeBd" Property="Background" Value="#1A2A1F"/>
+                    <Setter TargetName="BadgeDot" Property="Fill" Value="#7FD49B"/>
+                    <Setter TargetName="BadgeText" Property="Foreground" Value="#7FD49B"/>
+                  </DataTrigger>
+                  <DataTrigger Binding="{Binding Level}" Value="no">
+                    <Setter TargetName="BadgeBd" Property="Background" Value="#33201D"/>
+                    <Setter TargetName="BadgeDot" Property="Fill" Value="#FF8A80"/>
+                    <Setter TargetName="BadgeText" Property="Foreground" Value="#FF8A80"/>
+                  </DataTrigger>
+                </DataTemplate.Triggers>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
+      </Grid>
+
       <!-- Status line, shared by all pages -->
       <TextBlock x:Name="txtStatus" Grid.Row="1" Foreground="#A39E99" FontSize="13" TextWrapping="Wrap" Margin="40,0,40,14"/>
     </Grid>
@@ -1880,6 +2152,8 @@ $win = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeRe
 foreach ($n in 'dotRunning', 'txtRunning', 'btnNewSide', 'navCopies', 'navNew', 'txtCount',
                'viewMain', 'txtSearch', 'txtSearchHint', 'icCopies',
                'viewForm', 'btnFormBack', 'txtFormBack', 'txtFormTitle', 'txtFormSub', 'txtName', 'txtTarget', 'hintTarget',
+               'verdictBox', 'dotVerdict', 'txtVerdict',
+               'viewPicker', 'btnPickerBack', 'btnOtherExe', 'txtPickSearch', 'txtPickHint', 'txtPickInfo', 'icApps',
                'btnTarget', 'txtIcon', 'hintIcon', 'btnIcon', 'btnDefaults', 'cmbMode', 'txtHint', 'txtArgs', 'txtEnv', 'hintEnv',
                'chkTaskbar', 'chkDesktop', 'chkStart', 'chkOpen', 'rowOpen',
                'txtPrevMono', 'imgPrev', 'txtPrevName', 'txtPrevMode', 'btnSave', 'btnCancel', 'txtFormStatus',
@@ -2095,7 +2369,8 @@ function Show-Page([string]$page) {
     $viewMain.Visibility = if ($page -eq 'main') { 'Visible' } else { 'Collapsed' }
     $viewForm.Visibility = if ($page -eq 'form') { 'Visible' } else { 'Collapsed' }
     $viewDetail.Visibility = if ($page -eq 'detail') { 'Visible' } else { 'Collapsed' }
-    $newPage = ($page -eq 'form' -and -not $script:editing)
+    $viewPicker.Visibility = if ($page -eq 'picker') { 'Visible' } else { 'Collapsed' }
+    $newPage = (($page -eq 'form' -or $page -eq 'picker') -and -not $script:editing)
     if ($newPage) { $navCopies.Tag = $null; $navNew.Tag = 'Selected' }
     else { $navCopies.Tag = 'Selected'; $navNew.Tag = $null }
     if ($page -ne 'detail') { $script:detail = $null }
@@ -2221,6 +2496,7 @@ function Show-Form([string]$n) {
         $rowOpen.Visibility = 'Visible'
     }
     $txtFormStatus.Text = ''
+    $verdictBox.Visibility = 'Collapsed'
     $script:loading = $false
     Show-Page 'form'
     Update-Hint
@@ -2338,7 +2614,139 @@ $cmbMode.Add_SelectionChanged({
 foreach ($tb in $txtName, $txtTarget, $txtIcon, $txtEnv) { $tb.Add_TextChanged({ try { if (-not $script:loading) { Update-Preview } } catch { } }) }
 $btnDefaults.Add_Click({ try { Apply-Defaults } catch { Show-Error $_.Exception.Message } })
 
-$btnTarget.Add_Click({
+# --- picking the app ------------------------------------------------------------------------------------
+function Get-BadgeLabel([string]$level) {
+    if ($level -eq 'works') { return 'Works' }
+    if ($level -eq 'no') { return "Won't work" }
+    return 'Might work'
+}
+
+# The "can this app be copied?" line under the App field.
+function Show-Verdict([string]$level, [string]$reason) {
+    $fg = '#F2C46D'; $bg = '#2A2418'
+    if ($level -eq 'works') { $fg = '#7FD49B'; $bg = '#1A2A1F' }
+    if ($level -eq 'no') { $fg = '#FF8A80'; $bg = '#33201D' }
+    $dotVerdict.Fill = Get-Brush $fg
+    $verdictBox.Background = Get-Brush $bg
+    $txtVerdict.Text = (Get-BadgeLabel $level) + ': ' + $reason
+    $verdictBox.Visibility = 'Visible'
+}
+
+# Fills the form for an app: target, suggested name, isolation mode, arguments, and the verdict.
+function Use-AppPath([string]$path, [string]$displayName) {
+    if ([IO.Path]::GetExtension($path) -ieq '.lnk') {
+        $path = (New-Object -ComObject WScript.Shell).CreateShortcut($path).TargetPath
+    }
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { throw "File not found:`n$path" }
+
+    $store = $null
+    try { $store = Resolve-StoreApp $path } catch { }
+    if ($store -and -not $store.Target) { throw $store.Note }
+    $target = $path
+    $real = $path                       # the actual program, for the name, isolation mode and verdict
+    if ($store) {
+        $target = $store.Target
+        if ($store.Icon) { $real = $store.Icon }
+    }
+    $script:loading = $true
+    $txtTarget.Text = $target
+    if (-not $txtName.Text -and -not $script:editing) {
+        $desc = $displayName
+        if (-not $desc -and $store -and $store.Name) { $desc = $store.Name }
+        if (-not $desc) { try { $desc = [Diagnostics.FileVersionInfo]::GetVersionInfo($real).FileDescription } catch { } }
+        if (-not $desc) { $desc = [IO.Path]::GetFileNameWithoutExtension($real) }
+        $desc = ($desc -replace '[^A-Za-z0-9 _\-]', '').Trim()
+        if ($desc.Length -gt 38) { $desc = $desc.Substring(0, 38).Trim() }   # names are max 40 chars
+        $txtName.Text = "$desc 2"
+    }
+    $cmbMode.SelectedItem = Get-AutoMode $real
+    $script:loading = $false
+    Update-Hint
+    Apply-Defaults
+    $v = Get-AppVerdict $real
+    $reason = $v.Reason
+    if ($store) { $reason = 'Microsoft Store app, started through its launch alias. ' + $reason }
+    Show-Verdict $v.Level $reason
+    $txtFormStatus.Text = "Detected isolation: $($cmbMode.SelectedItem)."
+}
+
+function Update-PickerInfo {
+    $all = @($script:apps)
+    $works = @($all | Where-Object { $_.Level -eq 'works' }).Count
+    $maybe = @($all | Where-Object { $_.Level -eq 'maybe' }).Count
+    $no = @($all | Where-Object { $_.Level -eq 'no' }).Count
+    $txtPickInfo.Text = [string]$all.Count + ' apps: ' + $works + ' work, ' + $maybe + ' might work, ' + $no + " won't work. Not listed? Use Other .exe."
+}
+
+# Browse: a list of the installed apps with their verdicts (built once, then kept).
+function Show-Picker {
+    Show-Page 'picker'
+    if (-not $script:apps) {
+        $txtPickInfo.Text = 'Finding your apps...'
+        $win.Cursor = [System.Windows.Input.Cursors]::Wait
+        Show-Busy
+        try {
+            $list = [System.Collections.Generic.List[object]]::new()
+            foreach ($a in @(Get-InstalledApps)) {
+                $entry = [AlterUi.AppEntry]::new()
+                $entry.Name = [string]$a.Name
+                $entry.Target = [string]$a.Target
+                $entry.Real = [string]$a.Real
+                $entry.Level = [string]$a.Level
+                $entry.Badge = Get-BadgeLabel ([string]$a.Level)
+                $entry.Reason = [string]$a.Reason
+                if ($a.Real) {
+                    $src = Get-ImageSource ([string]$a.Real)
+                    if ($src) { $entry.Icon = $src.psobject.BaseObject }
+                }
+                $list.Add($entry)
+            }
+            $script:apps = $list
+            $icApps.ItemsSource = $list
+            $pv = [System.Windows.Data.CollectionViewSource]::GetDefaultView($list)
+            $pv.Filter = [Predicate[object]] {
+                param($o)
+                $q = $txtPickSearch.Text.Trim()
+                return (-not $q -or $o.Name.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+            }
+        }
+        finally { $win.Cursor = $null }
+    }
+    Update-PickerInfo
+    $txtPickSearch.Text = ''
+    $txtPickSearch.Focus() | Out-Null
+}
+
+$btnTarget.Add_Click({ try { Show-Picker } catch { $win.Cursor = $null; Show-Error $_.Exception.Message } })
+$btnPickerBack.Add_Click({ try { Show-Page 'form' } catch { Show-Error $_.Exception.Message } })
+
+$txtPickSearch.Add_TextChanged({
+    try {
+        if ($txtPickSearch.Text) { $txtPickHint.Visibility = 'Collapsed' } else { $txtPickHint.Visibility = 'Visible' }
+        if ($script:apps) { [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:apps).Refresh() }
+    }
+    catch { }
+})
+
+# A row in the picker: use that app (apps that won't work get a warning first, but are allowed).
+$icApps.AddHandler([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent, [System.Windows.RoutedEventHandler] {
+    param($sender, $e)
+    try {
+        $b = $e.OriginalSource
+        if (-not ($b -is [System.Windows.Controls.Button]) -or $b.Uid -ne 'pick') { return }
+        $app = $b.DataContext
+        if (-not $app.Target) { Show-Error ("$($app.Name) can't be copied.`n`n" + $app.Reason); return }
+        if ($app.Level -eq 'no') {
+            if (-not (Confirm-Box ("$($app.Name) probably won't work as a copy:`n`n" + $app.Reason + "`n`nUse it anyway?"))) { return }
+        }
+        Show-Page 'form'
+        Use-AppPath $app.Target $app.Name
+    }
+    catch { $script:loading = $false; Show-Error $_.Exception.Message }
+})
+
+# Other .exe...: the normal file picker, for apps that aren't in the Start Menu.
+$btnOtherExe.Add_Click({
     try {
         $dlg = New-Object System.Windows.Forms.OpenFileDialog
         $dlg.Filter = 'Applications (*.exe)|*.exe'
@@ -2349,40 +2757,8 @@ $btnTarget.Add_Click({
         $dlg.ValidateNames = $false
         $dlg.DereferenceLinks = $false
         if ($dlg.ShowDialog($script:owner) -ne 'OK') { return }
-
-        $path = $dlg.FileName
-        if ([IO.Path]::GetExtension($path) -ieq '.lnk') {
-            $path = (New-Object -ComObject WScript.Shell).CreateShortcut($path).TargetPath
-        }
-        if (-not $path -or -not (Test-Path -LiteralPath $path)) { throw "File not found:`n$($dlg.FileName)" }
-
-        $store = $null
-        try { $store = Resolve-StoreApp $path } catch { }
-        if ($store -and -not $store.Target) { throw $store.Note }
-        $target = $path
-        $real = $path                       # the actual program, for the name and isolation mode
-        if ($store) {
-            $target = $store.Target
-            if ($store.Icon) { $real = $store.Icon }
-        }
-        $script:loading = $true
-        $txtTarget.Text = $target
-        if (-not $txtName.Text -and -not $script:editing) {
-            $desc = $null
-            if ($store -and $store.Name) { $desc = $store.Name }
-            if (-not $desc) { try { $desc = [Diagnostics.FileVersionInfo]::GetVersionInfo($real).FileDescription } catch { } }
-            if (-not $desc) { $desc = [IO.Path]::GetFileNameWithoutExtension($real) }
-            $desc = ($desc -replace '[^A-Za-z0-9 _\-]', '').Trim()
-            if ($desc.Length -gt 38) { $desc = $desc.Substring(0, 38).Trim() }   # names are max 40 chars
-            $txtName.Text = "$desc 2"
-        }
-        $cmbMode.SelectedItem = Get-AutoMode $real
-        $script:loading = $false
-        Update-Hint
-        Apply-Defaults
-        $note = ''
-        if ($store -and $store.Note) { $note = $store.Note + ' ' }
-        $txtFormStatus.Text = "$($note)Detected isolation: $($cmbMode.SelectedItem)."
+        Show-Page 'form'
+        Use-AppPath $dlg.FileName ''
     }
     catch { $script:loading = $false; Show-Error $_.Exception.Message }
 })

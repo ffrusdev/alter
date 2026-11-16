@@ -21,9 +21,20 @@ This puts the `alter` command in `~/.local/bin` (no root needed). If your termin
 ### 2. Find the app you want to copy
 
 ```bash
-alter apps          # every app in your app menu, with the --app value to use
+alter apps          # every app in your app menu, whether it can be copied, and the --app value to use
 alter apps chrome   # just the ones matching "chrome"
+alter apps --why    # also show the reason for each verdict
 ```
+
+Each app gets a verdict:
+
+| Verdict | Means |
+|---|---|
+| **Works** | Browsers, Firefox and Electron apps (Chrome, Brave, VS Code, Discord, Obsidian…), as programs or Flatpaks. Each copy gets its own profile. |
+| **Might work** | Apps Alter doesn't know. Each copy gets its own settings folders, which is enough for most apps. |
+| **Won't work** | Apps known to allow only one copy (Spotify, Steam and other game launchers, Dropbox), and Snap apps. |
+
+`alter new` warns you before copying an app that won't work, but still makes the copy, in case it works for you.
 
 ### 3. Make a copy
 
